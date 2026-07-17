@@ -38,7 +38,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath Build \
-            build 2>&1 > build.log; EXIT_CODE=$?; cat build.log; exit $EXIT_CODE
+            build > build.log 2>&1; EXIT_CODE=$?; echo "--- EXIT CODE: $EXIT_CODE ---"; tail -50 build.log; exit $EXIT_CODE
 
       - name: 上传编译日志
         if: always()
