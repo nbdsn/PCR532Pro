@@ -8,7 +8,7 @@ class Crypto1 {
     private var state: UInt64 = 0
     
     // Keystream buffer
-    private var ksBuffer = [UInt32]()
+    private var ksBuffer = [UInt8]()
     private var ksBitPos = 0
     
     // MARK: - LFSR Feedback Polynomial

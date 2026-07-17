@@ -478,10 +478,11 @@ struct DumpDetailView: View {
                                 if start < sectorData.count {
                                     let blockData = Array(sectorData[start..<end])
                                     let isTrailer = (i + 1) % 4 == 0 || selectedSector >= 32
+                                    let blockNum = (start / 16 * 4) + (selectedSector * 4) + i
                                     
                                     VStack(alignment: .leading, spacing: 2) {
                                         HStack {
-                                            Text("Block \(start / 16 * 4 + (selectedSector * 4) + i)")
+                                            Text("Block \(blockNum)")
                                                 .font(.system(size: 10, design: .monospaced))
                                                 .foregroundColor(isTrailer ? .orange : .gray)
                                             if isTrailer {

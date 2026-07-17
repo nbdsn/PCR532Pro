@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 // MARK: - MIFARE Sector & Block
-struct MIFAREBlock: Identifiable, CustomStringConvertible {
+struct MIFAREBlock: Identifiable, Equatable, CustomStringConvertible {
     let id = UUID()
     let number: UInt8
     var data: [UInt8]  // 16 bytes
@@ -138,9 +138,18 @@ struct MIFAREDump: Identifiable, Codable {
     var date: Date
     var uid: [UInt8]
     var sak: UInt8
-    var atqa: (UInt8, UInt8)
-    var sectors: [Int: [UInt8]]  // sector number -> full sector data (blocks * 16 bytes)
-    var knownKeys: [Int: (key: [UInt8], type: UInt8)]  // sector -> (key, type)
+    var atqaValue: UInt16
+    var sectors: [Int: [UInt8]]
+    struct KnownKeyEntry: Codable {
+        var keyData: [UInt8]
+        var keyType: UInt8
+    }
+    var knownKeys: [Int: KnownKeyEntry]
+    
+    // Computed properties for backward compatibility
+    var atqa: (UInt8, UInt8) {
+        (UInt8((atqaValue >> 8) & 0xFF), UInt8(atqaValue & 0xFF))
+    }
     
     var uidString: String {
         uid.map { String(format: "%02X", $0) }.joined(separator: ":")
@@ -179,20 +188,20 @@ struct MIFAREDump: Identifiable, Codable {
         // Actually UID can be 4 or 7 bytes... simplified
         let _uid = [UInt8](data[0..<4])
         let sak = data[4]
-        let atqa = (data[5], data[6])
+        let atqaValue = (UInt16(data[5]) << 8) | UInt16(data[6])
         offset = 7
         
         var sectors = [Int: [UInt8]]()
         var sectorNum = 0
         while offset < data.count {
-            let sectorSize = sectorNum < 32 ? 64 : 256 // 4 blocks * 16 or 16 blocks * 16
+            let sectorSize = sectorNum < 32 ? 64 : 256
             guard offset + sectorSize <= data.count else { break }
             sectors[sectorNum] = [UInt8](data[offset..<offset + sectorSize])
             offset += sectorSize
             sectorNum += 1
         }
         
-        return MIFAREDump(name: name, date: Date(), uid: _uid, sak: sak, atqa: atqa, sectors: sectors, knownKeys: [:])
+        return MIFAREDump(name: name, date: Date(), uid: _uid, sak: sak, atqaValue: atqaValue, sectors: sectors, knownKeys: [:])
     }
 }
 
@@ -463,7 +472,7 @@ class MIFAREController: ObservableObject {
         guard let card = currentCard else { return false }
         
         var sectorData = [Int: [UInt8]]()
-        var knownKeys = [Int: (key: [UInt8], type: UInt8)]()
+        var knownKeys = [Int: MIFAREDump.KnownKeyEntry]()
         
         for sector in sectors {
             var fullData = [UInt8]()
@@ -472,16 +481,17 @@ class MIFAREController: ObservableObject {
             }
             sectorData[sector.number] = fullData
             if let key = sector.knownKey, let keyType = sector.knownKeyType {
-                knownKeys[sector.number] = (key, keyType)
+                knownKeys[sector.number] = MIFAREDump.KnownKeyEntry(keyData: key, keyType: keyType)
             }
         }
         
+        let atqaValue = (UInt16(card.atqa.0) << 8) | UInt16(card.atqa.1)
         let dump = MIFAREDump(
             name: name,
             date: Date(),
             uid: card.uid,
             sak: card.sak,
-            atqa: card.atqa,
+            atqaValue: atqaValue,
             sectors: sectorData,
             knownKeys: knownKeys
         )

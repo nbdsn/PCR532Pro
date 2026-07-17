@@ -514,8 +514,9 @@ struct HexEditorView: View {
                     }
                     
                     // ASCII preview
-                    if let bytes = HexUtils.hexToBytes(hexText), bytes.count == 16 {
-                        Text("ASCII: \(HexUtils.bytesToASCII(bytes))")
+                    let hexBytes = HexUtils.hexToBytes(hexText)
+                    if hexBytes.count == 16 {
+                        Text("ASCII: \(HexUtils.bytesToASCII(hexBytes))")
                             .font(.caption)
                             .foregroundColor(.gray)
                     }
@@ -642,7 +643,8 @@ struct HexEditorView: View {
     }
     
     private func setDefaultAccessBits() {
-        guard var currentBytes = HexUtils.hexToBytes(hexText), currentBytes.count == 16 else { return }
+        var currentBytes = HexUtils.hexToBytes(hexText)
+        guard currentBytes.count == 16 else { return }
         // Default access bits: 0xFF, 0x07, 0x80, 0x69
         // Key A readable, Key B readable, all access granted
         currentBytes[6] = 0xFF

@@ -338,7 +338,7 @@ class DarkSideAttack: ObservableObject {
         
         // For a simplified version, use a timing-based approach:
         // Different key candidates cause different patterns in auth responses
-        let recoveredKey = try await analyzeResponses(encryptedNonces)
+        let recoveredKey = try await analyzeResponses(encryptedNonces, targetBlock: targetBlock)
         
         await MainActor.run {
             progress = 1.0
@@ -353,7 +353,7 @@ class DarkSideAttack: ObservableObject {
     }
     
     /// Analyze collected responses to recover the key
-    private func analyzeResponses(_ responses: [[UInt8]]) async throws -> [UInt8]? {
+    private func analyzeResponses(_ responses: [[UInt8]], targetBlock: UInt8) async throws -> [UInt8]? {
         // In a full implementation, this would:
         // 1. Align all encrypted nonce responses
         // 2. Extract the encrypted nt (nonce transmitted by card)
