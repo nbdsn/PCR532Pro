@@ -7,25 +7,15 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: 诊断环境
-        run: |
-          echo "Xcode: $(xcodebuild -version 2>&1)"
-          echo "Swift: $(swift --version 2>&1)"
-          echo "SDKs: $(xcodebuild -showsdks 2>&1)"
 
       - name: 安装 XcodeGen
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen 2>&1
 
       - name: 生成项目
-        run: |
-          rm -rf PCR532Pro.xcodeproj 2>/dev/null
-          xcodegen 2>&1
-          ls -la PCR532Pro.xcodeproj/ 2>&1
-          ls -la PCR532Pro.xcodeproj/xcshareddata/xcschemes/ 2>&1 || echo "No xcschemes dir"
+        run: xcodegen 2>&1
 
       - name: 编译
         run: |
