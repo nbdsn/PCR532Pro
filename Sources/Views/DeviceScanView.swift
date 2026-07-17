@@ -102,7 +102,7 @@ struct DeviceScanView: View {
                     Image(systemName: "antenna.radiowaves.left.and.right.slash")
                         .font(.system(size: 50))
                         .foregroundColor(.gray)
-                    Text("点击"扫描设备"查找\nPCR532 Pro 蓝牙读写器")
+                    Text("点击「扫描设备」查找\nPCR532 Pro 蓝牙读写器")
                         .font(.body)
                         .foregroundColor(.gray)
                         .multilineTextAlignment(.center)

@@ -123,7 +123,7 @@ struct CardInfoView: View {
                     Text("未检测到卡片")
                         .font(.title2)
                         .foregroundColor(.gray)
-                    Text("请将卡片靠近读写器\n然后点击"检测卡片"")
+                    Text("请将卡片靠近读写器\n然后点击「检测卡片」")
                         .font(.body)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
