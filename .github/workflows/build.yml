@@ -28,7 +28,7 @@ jobs:
         id: build
         continue-on-error: true
         run: |
-          set -o pipefail
+          set +e
           xcodebuild \
             -project PCR532Pro.xcodeproj \
             -scheme PCR532Pro \
@@ -38,12 +38,14 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath Build \
             build 2>&1 | tee build.log
-          echo "status=$?" >> $GITHUB_OUTPUT
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "Xcodebuild exit code: $EXIT_CODE"
+          echo "status=$EXIT_CODE" >> $GITHUB_OUTPUT
 
       - name: 显示错误日志
-        if: steps.build.outputs.status != '0' || failure()
+        if: steps.build.outputs.status != '0'
         run: |
-          echo "=== Build log (last 50 lines) ==="
+          echo "=== Build log (last 100 lines) ==="
           tail -50 build.log
           echo "=== Full log available as artifact ==="
 
