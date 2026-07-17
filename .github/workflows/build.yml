@@ -11,43 +11,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 XcodeGen
-        run: brew install xcodegen
+      - name: 诊断环境
+        run: |
+          echo "=== Xcode ==="
+          xcode-select -p
+          xcodebuild -version
+          echo "=== Swift ==="
+          swift --version
+          echo "=== SDKs ==="
+          xcodebuild -showsdks
 
-      - name: 生成 Xcode 项目
+      - name: 安装 XcodeGen
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+
+      - name: 生成项目
         run: xcodegen
 
-      - name: 检查 Scheme
-        run: |
-          echo "=== Xcode version ==="
-          xcodebuild -version
-          echo "=== Available schemes ==="
-          xcodebuild -list -project PCR532Pro.xcodeproj 2>&1
+      - name: 列出 Scheme
+        run: xcodebuild -list -project PCR532Pro.xcodeproj 2>&1
 
       - name: 编译
-        id: build
-        continue-on-error: true
         run: |
-          set +e
           xcodebuild \
             -project PCR532Pro.xcodeproj \
             -scheme PCR532Pro \
             -configuration Release \
+            -sdk iphoneos \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath Build \
-            build 2>&1 | tee build.log
-          EXIT_CODE=${PIPESTATUS[0]}
-          echo "Xcodebuild exit code: $EXIT_CODE"
-          echo "status=$EXIT_CODE" >> $GITHUB_OUTPUT
-
-      - name: 显示错误日志
-        if: steps.build.outputs.status != '0'
-        run: |
-          echo "=== Build log (last 100 lines) ==="
-          tail -50 build.log
-          echo "=== Full log available as artifact ==="
+            build 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
 
       - name: 上传编译日志
         if: always()
@@ -57,24 +51,16 @@ jobs:
           path: build.log
 
       - name: 打包 .ipa
-        if: steps.build.outputs.status == '0'
+        if: success()
         run: |
-          APP_PATH=$(find Build -name "PCR532Pro.app" -type d | head -1)
-          if [ -n "$APP_PATH" ]; then
-            echo "Found .app at: $APP_PATH"
-            mkdir -p Payload
-            cp -r "$APP_PATH" Payload/
-            zip -r PCR532Pro.ipa Payload/
-            rm -rf Payload
-          else
-            echo "ERROR: .app not found"
-            exit 1
+          APP=$(find Build -name "PCR532Pro.app" -type d | head -1)
+          if [ -n "$APP" ]; then
+            mkdir -p Payload && cp -r "$APP" Payload/ && zip -r PCR532Pro.ipa Payload/
           fi
 
       - name: 上传 .ipa
-        if: steps.build.outputs.status == '0'
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: PCR532Pro-ipa
           path: PCR532Pro.ipa
-          compression-level: 0
