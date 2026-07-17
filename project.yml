@@ -1,0 +1,48 @@
+name: PCR532Pro
+options:
+  bundleIdPrefix: com.pcr532
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+
+targets:
+  PCR532Pro:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.pcr532.pro
+      INFOPLIST_FILE: Info.plist
+      DEVELOPMENT_TEAM: ""
+      TARGETED_DEVICE_FAMILY: "1"
+      IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+      SWIFT_VERSION: "5.9"
+      SWIFT_OBJC_BRIDGING_HEADER: ""
+      ENABLE_BITCODE: NO
+      GENERATE_INFOPLIST_FILE: YES
+    info:
+      path: Info.plist
+      properties:
+        UISupportedExternalAccessoryProtocols: []
+        UIBackgroundModes:
+          - bluetooth-central
+          - bluetooth-peripheral
+        NSBluetoothAlwaysUsageDescription: "PCR532 Pro 需要使用蓝牙连接 NFC 读写器"
+        NSBluetoothPeripheralUsageDescription: "PCR532 Pro 需要通过蓝牙与 NFC 读写器通信"
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).SceneDelegate
+        UILaunchScreen:
+          UIColorName: AccentColor
+        UIRequiredDeviceCapabilities:
+          - arm64
+        CFBundleDisplayName: PCR532
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait

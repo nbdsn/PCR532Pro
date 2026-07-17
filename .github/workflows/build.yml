@@ -1,0 +1,45 @@
+name: Build PCR532 Pro
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build:
+    runs-on: macos-14  # M1/M2 Mac, 速度快
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 项目
+        run: xcodegen
+
+      - name: 编译（无签名）
+        run: |
+          xcodebuild build \
+            -project PCR532Pro.xcodeproj \
+            -scheme PCR532Pro \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath Build/Products
+
+      - name: 打包 .ipa
+        run: |
+          mkdir -p Payload
+          cp -r Build/Products/Build/Products/Release-iphoneos/PCR532Pro.app Payload/
+          zip -r PCR532Pro.ipa Payload/
+          rm -rf Payload
+
+      - name: 上传 .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCR532Pro-ipa
+          path: PCR532Pro.ipa
+          compression-level: 0

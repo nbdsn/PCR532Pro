@@ -1,0 +1,524 @@
+import Foundation
+
+// MARK: - MIFARE Sector & Block
+struct MIFAREBlock: Identifiable, CustomStringConvertible {
+    let id = UUID()
+    let number: UInt8
+    var data: [UInt8]  // 16 bytes
+    var isSectorTrailer: Bool { (number + 1) % 4 == 0 || number >= 128 }
+    var isValueBlock: Bool { !isSectorTrailer && number > 0 && number < 128 }
+    
+    var hexString: String {
+        data.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+    
+    var description: String {
+        "Block \(number): \(hexString)"
+    }
+    
+    // Sector trailer parsing
+    var keyA: [UInt8] {
+        guard isSectorTrailer && data.count >= 16 else { return [UInt8](repeating: 0, count: 6) }
+        return Array(data[0..<6])
+    }
+    
+    var accessBits: [UInt8] {
+        guard isSectorTrailer && data.count >= 16 else { return [UInt8](repeating: 0, count: 4) }
+        return Array(data[6..<10])
+    }
+    
+    var keyB: [UInt8] {
+        guard isSectorTrailer && data.count >= 16 else { return [UInt8](repeating: 0, count: 6) }
+        return Array(data[10..<16])
+    }
+    
+    var accessBitsDescription: String {
+        guard isSectorTrailer && data.count >= 10 else { return "N/A" }
+        let ab = accessBits
+        // Parse access conditions (simplified)
+        // C1 = bit 0, C2 = bit 1, C3 = bit 2 (inverted)
+        let c1 = ((ab[0] >> 4) & 0x0F) ^ 0x0F
+        let c2 = (ab[0] & 0x0F) ^ 0x0F
+        let c3 = ((ab[2] >> 4) & 0x0F) ^ 0x0F
+        return "C1=\(String(c1, radix: 2).padding(toLength: 4, withPad: "0", startingAt: 0)) C2=\(String(c2, radix: 2).padding(toLength: 4, withPad: "0", startingAt: 0)) C3=\(String(c3, radix: 2).padding(toLength: 4, withPad: "0", startingAt: 0))"
+    }
+}
+
+struct MIFARESector: Identifiable {
+    let id = UUID()
+    let number: Int
+    var blocks: [MIFAREBlock]
+    
+    var is4K: Bool { number >= 32 }
+    var blockCount: Int { is4K ? 16 : 4 }
+    var startBlock: Int {
+        number < 32 ? number * 4 : 128 + (number - 32) * 16
+    }
+    
+    var trailerBlock: MIFAREBlock? {
+        blocks.last
+    }
+    
+    var isAuthenticated: Bool = false
+    var knownKeyType: UInt8? = nil // 0x60 = Key A, 0x61 = Key B
+    var knownKey: [UInt8]? = nil
+    
+    var dataBlocks: [MIFAREBlock] {
+        blocks.filter { !$0.isSectorTrailer }
+    }
+}
+
+// MARK: - MIFARE Key Manager
+class MIFAREKeyManager {
+    // Default keys known to work on most MIFARE Classic cards
+    static let defaultKeys: [[UInt8]] = [
+        [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // Factory default
+        [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5],
+        [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        [0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD],
+        [0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F],
+        [0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0],
+        [0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1],
+        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+        [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0xFF],
+        [0x11, 0x11, 0x11, 0x11, 0x11, 0x11],
+        [0x22, 0x22, 0x22, 0x22, 0x22, 0x22],
+        [0x33, 0x33, 0x33, 0x33, 0x33, 0x33],
+        [0x44, 0x44, 0x44, 0x44, 0x44, 0x44],
+        [0x55, 0x55, 0x55, 0x55, 0x55, 0x55],
+        [0x66, 0x66, 0x66, 0x66, 0x66, 0x66],
+        [0x77, 0x77, 0x77, 0x77, 0x77, 0x77],
+        [0x88, 0x88, 0x88, 0x88, 0x88, 0x88],
+        [0x99, 0x99, 0x99, 0x99, 0x99, 0x99],
+        [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA],
+        [0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB],
+        [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+        [0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD],
+        [0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE],
+        [0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56],
+        [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB],
+        [0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00],
+        [0x70, 0x69, 0x73, 0x73, 0x65, 0x73], // "pisses" (another common test key)
+        [0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54],
+        [0x20, 0x21, 0x22, 0x23, 0x24, 0x25],
+        [0x30, 0x31, 0x32, 0x33, 0x34, 0x35],
+        [0x40, 0x41, 0x42, 0x43, 0x44, 0x45],
+        [0x50, 0x51, 0x52, 0x53, 0x54, 0x55],
+        [0x60, 0x61, 0x62, 0x63, 0x64, 0x65],
+        [0x70, 0x71, 0x72, 0x73, 0x74, 0x75],
+        [0x80, 0x81, 0x82, 0x83, 0x84, 0x85],
+        [0x90, 0x91, 0x92, 0x93, 0x94, 0x95],
+        [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // Duplicate, but keep for count
+        [0x4E, 0x4E, 0x4E, 0x4E, 0x4E, 0x4E],
+    ]
+    
+    static let defaultKeysDescription: [(String, [UInt8])] = [
+        ("工厂默认", [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+        ("A0A1A2A3A4A5", [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]),
+        ("B0B1B2B3B4B5", [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]),
+        ("4D3A99C351DD", [0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD]),
+        ("全零", [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+        ("全A", [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]),
+        ("全B", [0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB]),
+    ]
+}
+
+// MARK: - MIFARE Card Dump
+struct MIFAREDump: Identifiable, Codable {
+    let id = UUID()
+    var name: String
+    var date: Date
+    var uid: [UInt8]
+    var sak: UInt8
+    var atqa: (UInt8, UInt8)
+    var sectors: [Int: [UInt8]]  // sector number -> full sector data (blocks * 16 bytes)
+    var knownKeys: [Int: (key: [UInt8], type: UInt8)]  // sector -> (key, type)
+    
+    var uidString: String {
+        uid.map { String(format: "%02X", $0) }.joined(separator: ":")
+    }
+    
+    var formattedDate: String {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return df.string(from: date)
+    }
+    
+    var sectorCount: Int {
+        sectors.count
+    }
+    
+    /// Convert dump to binary data for export
+    func toBinary() -> Data {
+        var data = Data()
+        data.append(contentsOf: uid)
+        data.append(sak)
+        data.append(atqa.0)
+        data.append(atqa.1)
+        
+        let sortedSectors = sectors.sorted { $0.key < $1.key }
+        for (_, sectorData) in sortedSectors {
+            data.append(contentsOf: sectorData)
+        }
+        return data
+    }
+    
+    /// Load dump from binary data
+    static func fromBinary(_ data: Data, name: String) -> MIFAREDump? {
+        guard data.count >= 4 else { return nil }
+        var offset = 0
+        let uid = [data[offset]]; offset += 1
+        // Actually UID can be 4 or 7 bytes... simplified
+        let _uid = [UInt8](data[0..<4])
+        let sak = data[4]
+        let atqa = (data[5], data[6])
+        offset = 7
+        
+        var sectors = [Int: [UInt8]]()
+        var sectorNum = 0
+        while offset < data.count {
+            let sectorSize = sectorNum < 32 ? 64 : 256 // 4 blocks * 16 or 16 blocks * 16
+            guard offset + sectorSize <= data.count else { break }
+            sectors[sectorNum] = [UInt8](data[offset..<offset + sectorSize])
+            offset += sectorSize
+            sectorNum += 1
+        }
+        
+        return MIFAREDump(name: name, date: Date(), uid: _uid, sak: sak, atqa: atqa, sectors: sectors, knownKeys: [:])
+    }
+}
+
+// MARK: - MIFARE Card Controller
+// This is the main class that handles all MIFARE operations via PN532
+class MIFAREController: ObservableObject {
+    @Published var currentCard: CardInfo?
+    @Published var sectors = [MIFARESector]()
+    @Published var isReading = false
+    @Published var progress: Double = 0
+    @Published var statusMessage = ""
+    @Published var dumpHistory = [MIFAREDump]()
+    
+    private let bleManager: BLEManager
+    private var keyManager = MIFAREKeyManager()
+    var customKeys = [[UInt8]]()
+    
+    init(bleManager: BLEManager) {
+        self.bleManager = bleManager
+    }
+    
+    // MARK: - Card Detection
+    
+    /// Detect card and get UID/SAK/ATQA
+    func detectCard() async throws -> CardInfo {
+        statusMessage = "检测卡片..."
+        
+        // Auto poll for cards
+        let pollFrame = PN532CommandBuilder.autoPoll(maxCards: 1, period: 2)
+        let pollResponse = try await bleManager.sendFrame(pollFrame)
+        
+        // Parse response
+        guard pollResponse.data.count >= 1 else {
+            throw PN532Error.noCardPresent
+        }
+        
+        let nbtg = pollResponse.data[0]
+        guard nbtg > 0 else {
+            throw PN532Error.noCardPresent
+        }
+        
+        // Parse target data
+        // InAutoPoll response includes the target data same as InListPassiveTarget
+        let cards = PN532ResponseParser.parseTargetList(pollResponse.data)
+        guard let card = cards.first else {
+            throw PN532Error.noCardPresent
+        }
+        
+        currentCard = card
+        statusMessage = "检测到: \(card.typeDescription) (UID: \(card.uidString))"
+        return card
+    }
+    
+    /// Detect card using InListPassiveTarget (more control)
+    func detectCardDirect() async throws -> CardInfo {
+        statusMessage = "检测卡片..."
+        
+        let listFrame = PN532CommandBuilder.listPassiveTarget(maxTargets: 1, baudRate: 0x00)
+        let response = try await bleManager.sendFrame(listFrame)
+        
+        let cards = PN532ResponseParser.parseTargetList(response.data)
+        guard let card = cards.first else {
+            throw PN532Error.noCardPresent
+        }
+        
+        currentCard = card
+        statusMessage = "检测到: \(card.typeDescription) (UID: \(card.uidString))"
+        return card
+    }
+    
+    // MARK: - Authentication
+    
+    /// Authenticate with a sector/block using given key
+    func authenticate(sector: Int, block: UInt8, key: [UInt8], keyType: UInt8) async throws -> Bool {
+        let authFrame = PN532CommandBuilder.inDataExchange(
+            target: 0x01,
+            mifareCmd: keyType,
+            data: key + [block]
+        )
+        
+        let response = try await bleManager.sendFrame(authFrame)
+        let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
+        
+        if success {
+            if sector < sectors.count {
+                sectors[sector].isAuthenticated = true
+                sectors[sector].knownKey = key
+                sectors[sector].knownKeyType = keyType
+            }
+        }
+        
+        return success
+    }
+    
+    /// Try to authenticate with known keys (dictionary attack for a single sector)
+    func tryDefaultKeys(sector: Int, block: UInt8) async throws -> (Bool, [UInt8], UInt8) {
+        let allKeys = MIFAREKeyManager.defaultKeys + customKeys
+        
+        // Try Key A first, then Key B
+        for keyType: UInt8 in [0x60, 0x61] {
+            for key in allKeys {
+                let success = try await authenticate(sector: sector, block: block, key: key, keyType: keyType)
+                if success {
+                    statusMessage = "扇区 \(sector) 密钥已找到: \(key.map { String(format: "%02X", $0) }.joined()) (\(keyType == 0x60 ? "A" : "B"))"
+                    return (true, key, keyType)
+                }
+            }
+        }
+        
+        return (false, [UInt8](repeating: 0, count: 6), 0)
+    }
+    
+    // MARK: - Read Operations
+    
+    /// Read a single block
+    func readBlock(block: UInt8) async throws -> [UInt8] {
+        let readFrame = PN532CommandBuilder.mifareReadBlock(target: 0x01, block: block)
+        let response = try await bleManager.sendFrame(readFrame)
+        let (success, data) = PN532ResponseParser.parseDataExchange(response.data)
+        
+        guard success, data.count >= 16 else {
+            throw PN532Error.communicationError("读块失败 Block \(block)")
+        }
+        
+        return Array(data[0..<16])
+    }
+    
+    /// Read a sector (all blocks)
+    func readSector(sectorNum: Int, key: [UInt8], keyType: UInt8) async throws -> MIFARESector {
+        let sector = MIFARESector(number: sectorNum, blocks: [])
+        let is4K = sectorNum >= 32
+        let blockCount = is4K ? 16 : 4
+        let startBlock = sectorNum < 32 ? sectorNum * 4 : 128 + (sectorNum - 32) * 16
+        
+        var blocks = [MIFAREBlock]()
+        
+        // Authenticate with the sector trailer block
+        let trailerBlock = UInt8(startBlock + blockCount - 1)
+        let authSuccess = try await authenticate(sector: sectorNum, block: trailerBlock, key: key, keyType: keyType)
+        
+        guard authSuccess else {
+            throw PN532Error.authFailed
+        }
+        
+        // Read all blocks in the sector
+        for i in 0..<blockCount {
+            let blockNum = UInt8(startBlock + i)
+            let data = try await readBlock(block: blockNum)
+            blocks.append(MIFAREBlock(number: blockNum, data: data))
+            
+            await MainActor.run {
+                progress = Double(sectorNum * blockCount + i + 1) / Double(40 * 4)
+            }
+        }
+        
+        var result = MIFARESector(number: sectorNum, blocks: blocks)
+        result.isAuthenticated = true
+        result.knownKey = key
+        result.knownKeyType = keyType
+        
+        return result
+    }
+    
+    /// Read all sectors (full dump)
+    func readAllSectors(progressCallback: ((Double) -> Void)? = nil) async throws -> [MIFARESector] {
+        isReading = true
+        progress = 0
+        statusMessage = "开始全卡读取..."
+        
+        var allSectors = [MIFARESector]()
+        let totalSectors = currentCard?.totalSectors ?? 16
+        
+        // First, try default keys on sector 0 to get a known key
+        let (found, key, keyType) = try await tryDefaultKeys(sector: 0, block: 0)
+        
+        if !found {
+            statusMessage = "默认密钥无效，无法读取"
+            isReading = false
+            throw PN532Error.authFailed
+        }
+        
+        // Read sector 0 first
+        let sector0 = try await readSector(sectorNum: 0, key: key, keyType: keyType)
+        allSectors.append(sector0)
+        progress = 1.0 / Double(totalSectors)
+        
+        // Try to read remaining sectors
+        for i in 1..<totalSectors {
+            await MainActor.run {
+                statusMessage = "读取扇区 \(i)/\(totalSectors - 1)..."
+                progress = Double(i) / Double(totalSectors)
+            }
+            
+            // Try known key first
+            do {
+                let sector = try await readSector(sectorNum: i, key: key, keyType: keyType)
+                allSectors.append(sector)
+            } catch {
+                // Key didn't work for this sector, try dictionary attack
+                let sectorStartBlock = i < 32 ? UInt8(i * 4 + 3) : UInt8(128 + (i - 32) * 16 + 15)
+                let (foundSectorKey, sectorKey, sectorKeyType) = try await tryDefaultKeys(sector: i, block: sectorStartBlock)
+                
+                if foundSectorKey {
+                    let sector = try await readSector(sectorNum: i, key: sectorKey, keyType: sectorKeyType)
+                    allSectors.append(sector)
+                } else {
+                    // Create empty sector
+                    let blockCount = i >= 32 ? 16 : 4
+                    let startBlock = i < 32 ? i * 4 : 128 + (i - 32) * 16
+                    var blocks = [MIFAREBlock]()
+                    for b in 0..<blockCount {
+                        blocks.append(MIFAREBlock(number: UInt8(startBlock + b), data: [UInt8](repeating: 0x00, count: 16)))
+                    }
+                    var emptySector = MIFARESector(number: i, blocks: blocks)
+                    emptySector.isAuthenticated = false
+                    allSectors.append(emptySector)
+                    statusMessage = "扇区 \(i): 密钥未知，跳过"
+                }
+            }
+        }
+        
+        sectors = allSectors
+        isReading = false
+        progress = 1.0
+        statusMessage = "读取完成: \(allSectors.filter { $0.isAuthenticated }.count)/\(totalSectors) 个扇区已解密"
+        
+        return allSectors
+    }
+    
+    // MARK: - Write Operations
+    
+    /// Write a single block
+    func writeBlock(block: UInt8, data: [UInt8]) async throws -> Bool {
+        guard data.count == 16 else {
+            throw PN532Error.communicationError("写入数据必须为16字节")
+        }
+        
+        let writeFrame = PN532CommandBuilder.mifareWriteBlock(target: 0x01, block: block, data: data)
+        let response = try await bleManager.sendFrame(writeFrame)
+        let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
+        return success
+    }
+    
+    /// Write a sector (all data blocks + trailer)
+    func writeSector(_ sector: MIFARESector) async throws -> Bool {
+        guard let key = sector.knownKey, let keyType = sector.knownKeyType else {
+            throw PN532Error.authFailed
+        }
+        
+        let trailerBlock = sector.blocks.last!
+        let authSuccess = try await authenticate(sector: sector.number, block: trailerBlock.number, key: key, keyType: keyType)
+        guard authSuccess else { throw PN532Error.authFailed }
+        
+        for block in sector.blocks {
+            if !block.isSectorTrailer || block == sector.blocks.last {
+                let success = try await writeBlock(block: block.number, data: block.data)
+                guard success else { return false }
+            }
+        }
+        
+        return true
+    }
+    
+    // MARK: - Dump Management
+    
+    /// Save current dump to local storage
+    func saveCurrentDump(name: String) -> Bool {
+        guard let card = currentCard else { return false }
+        
+        var sectorData = [Int: [UInt8]]()
+        var knownKeys = [Int: (key: [UInt8], type: UInt8)]()
+        
+        for sector in sectors {
+            var fullData = [UInt8]()
+            for block in sector.blocks {
+                fullData.append(contentsOf: block.data)
+            }
+            sectorData[sector.number] = fullData
+            if let key = sector.knownKey, let keyType = sector.knownKeyType {
+                knownKeys[sector.number] = (key, keyType)
+            }
+        }
+        
+        let dump = MIFAREDump(
+            name: name,
+            date: Date(),
+            uid: card.uid,
+            sak: card.sak,
+            atqa: card.atqa,
+            sectors: sectorData,
+            knownKeys: knownKeys
+        )
+        
+        dumpHistory.append(dump)
+        saveDumpsToDisk()
+        return true
+    }
+    
+    /// Extract dump to binary for export
+    func exportDumpToBinary(_ dump: MIFAREDump) -> Data {
+        return dump.toBinary()
+    }
+    
+    /// Import dump from binary data
+    func importDumpFromBinary(_ data: Data, name: String) -> MIFAREDump? {
+        return MIFAREDump.fromBinary(data, name: name)
+    }
+    
+    // MARK: - Persistence
+    
+    private func dumpsFilePath() -> URL {
+        let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        return paths[0].appendingPathComponent("pcr532_dumps.json")
+    }
+    
+    func loadDumpsFromDisk() {
+        let url = dumpsFilePath()
+        guard let data = try? Data(contentsOf: url),
+              let dumps = try? JSONDecoder().decode([MIFAREDump].self, from: data) else {
+            return
+        }
+        dumpHistory = dumps
+    }
+    
+    func saveDumpsToDisk() {
+        let url = dumpsFilePath()
+        guard let data = try? JSONEncoder().encode(dumpHistory) else { return }
+        try? data.write(to: url)
+    }
+}

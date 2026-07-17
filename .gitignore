@@ -1,0 +1,40 @@
+# Xcode
+*.xcworkspace
+*.xcuserdata
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+DerivedData/
+Build/
+build/
+
+# XcodeGen
+*.xcodeproj
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Fastlane
+fastlane/report.xml
+fastlane/screenshots/
+fastlane/test_output/
+
+# Carthage
+Carthage/
+
+# CocoaPods
+Pods/
+
+# Swift Package Manager
+.packages/
+.build/
+Package.resolved
+
+# IPA
+*.ipa
+
+# IDE
+.idea/
+.vscode/
+*.swp
