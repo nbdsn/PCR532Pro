@@ -13,22 +13,19 @@ jobs:
 
       - name: 诊断环境
         run: |
-          echo "=== Xcode ==="
-          xcode-select -p
-          xcodebuild -version
-          echo "=== Swift ==="
-          swift --version
-          echo "=== SDKs ==="
-          xcodebuild -showsdks
+          echo "Xcode: $(xcodebuild -version 2>&1)"
+          echo "Swift: $(swift --version 2>&1)"
+          echo "SDKs: $(xcodebuild -showsdks 2>&1)"
 
       - name: 安装 XcodeGen
-        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen 2>&1
 
       - name: 生成项目
-        run: xcodegen
-
-      - name: 列出 Scheme
-        run: xcodebuild -list -project PCR532Pro.xcodeproj 2>&1
+        run: |
+          rm -rf PCR532Pro.xcodeproj 2>/dev/null
+          xcodegen 2>&1
+          ls -la PCR532Pro.xcodeproj/ 2>&1
+          ls -la PCR532Pro.xcodeproj/xcshareddata/xcschemes/ 2>&1 || echo "No xcschemes dir"
 
       - name: 编译
         run: |
@@ -41,7 +38,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath Build \
-            build 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+            build 2>&1 > build.log; EXIT_CODE=$?; cat build.log; exit $EXIT_CODE
 
       - name: 上传编译日志
         if: always()
@@ -56,6 +53,9 @@ jobs:
           APP=$(find Build -name "PCR532Pro.app" -type d | head -1)
           if [ -n "$APP" ]; then
             mkdir -p Payload && cp -r "$APP" Payload/ && zip -r PCR532Pro.ipa Payload/
+          else
+            echo "No .app found!"
+            exit 1
           fi
 
       - name: 上传 .ipa
