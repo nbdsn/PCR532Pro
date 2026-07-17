@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // MARK: - Magic Card (UID Writable Card) Support
 // Magic cards (also called Chinese magic cards) are special MIFARE Classic

@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // MARK: - MIFARE Sector & Block
 struct MIFAREBlock: Identifiable, CustomStringConvertible {

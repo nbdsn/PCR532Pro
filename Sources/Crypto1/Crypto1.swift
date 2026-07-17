@@ -293,17 +293,6 @@ class Crypto1 {
     }
 }
 
-// MARK: - Extended UInt64 Helper
-extension BinaryInteger {
-    var nonzeroBitCount: Int {
-        return sequence(state: self as! UInt64) { val in
-            guard val != 0 else { return nil }
-            defer { val &= val - 1 }
-            return 1
-        }.reduce(0, +)
-    }
-}
-
 // Proper implementation of nonzeroBitCount for UInt64
 extension UInt64 {
     var nonzeroBitCount: Int {

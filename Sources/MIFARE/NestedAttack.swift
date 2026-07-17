@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // MARK: - Nested Attack
 // Recovers unknown MIFARE Classic keys using a known key
