@@ -1,4 +1,4 @@
-﻿import SwiftUI
+import SwiftUI
 import CoreBluetooth
 
 // MARK: - Device Scan View
@@ -41,7 +41,7 @@ struct DeviceScanView: View {
                     .foregroundColor(.secondary)
                 Spacer()
                 if bleManager.isConnected {
-                    Button("鏂紑") {
+                    Button("Disconnect") {
                         bleManager.disconnect()
                     }
                     .foregroundColor(.red)
@@ -62,13 +62,13 @@ struct DeviceScanView: View {
                         if useAllDevices {
                             bleManager.startScanAll()
                         } else {
-                            bleManager.startScan()
+                            bleManager.startScanFilteredByService()
                         }
                     }
                 }) {
                     HStack {
                         Image(systemName: isScanning ? "stop.fill" : "magnifyingglass")
-                        Text(isScanning ? "鍋滄鎵弿" : "鎵弿璁惧")
+                        Text(isScanning ? "Stop" : "Scan")
                     }
                     .font(.subheadline)
                     .padding(.horizontal, 16)
@@ -79,7 +79,7 @@ struct DeviceScanView: View {
                 }
                 .disabled(bleManager.isConnected || bleManager.connectionState == .connecting)
                 
-                Toggle("鍏ㄩ儴", isOn: $useAllDevices)
+                Toggle("All", isOn: $useAllDevices)
                     .font(.caption)
                     .toggleStyle(.switch)
                     .scaleEffect(0.8)
@@ -102,7 +102,7 @@ struct DeviceScanView: View {
                     Image(systemName: "antenna.radiowaves.left.and.right.slash")
                         .font(.system(size: 50))
                         .foregroundColor(.gray)
-                    Text("鐐瑰嚮銆屾壂鎻忚澶囥€嶆煡鎵綷nPCR532 Pro 钃濈墮璇诲啓鍣?)
+                    Text("Tap Scan to find PCR532 Pro")
                         .font(.body)
                         .foregroundColor(.gray)
                         .multilineTextAlignment(.center)
@@ -143,10 +143,11 @@ struct DeviceScanView: View {
     }
     
     private var connectionStatusText: String {
-        if bleManager.isConnected { return "宸茶繛鎺? \(bleManager.connectedDeviceName)" }
-        if bleManager.connectionState == .connecting { return "杩炴帴涓?.." }
-        if bleManager.connectionState == .discovering { return "鍙戠幇鏈嶅姟..." }
-        return "鏈繛鎺?
+        if bleManager.isConnected { return "Connected: \(bleManager.connectedDeviceName)" }
+        if bleManager.connectionState == .connecting { return "Connecting..." }
+        if bleManager.connectionState == .discovering { return "Discovering services..." }
+        if bleManager.connectionState == .ready { return "Ready" }
+        return "Not connected"
     }
 }
 
@@ -156,7 +157,6 @@ struct DeviceRow: View {
     
     var body: some View {
         HStack {
-            // Signal indicator
             VStack {
                 Image(systemName: "antenna.radiowaves.left.and.right")
                     .foregroundColor(signalColor)
@@ -177,7 +177,6 @@ struct DeviceRow: View {
             
             Spacer()
             
-            // Signal bars
             HStack(spacing: 2) {
                 ForEach(0..<4, id: \.self) { i in
                     RoundedRectangle(cornerRadius: 1)
@@ -206,18 +205,18 @@ struct DeviceScanWrapper: View {
     var body: some View {
         NavigationView {
             DeviceScanView(bleManager: bleManager, selectedDevice: $selectedDevice)
-                .navigationTitle("杩炴帴璁惧")
+                .navigationTitle("Connect Device")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         if bleManager.isConnected {
-                            Button("瀹屾垚") {
+                            Button("Done") {
                                 showScanner = false
                             }
                         }
                     }
                     ToolbarItem(placement: .navigationBarLeading) {
-                        Button("鍙栨秷") {
+                        Button("Cancel") {
                             bleManager.stopScan()
                             showScanner = false
                         }
@@ -237,7 +236,7 @@ struct ConnectionBadge: View {
             Circle()
                 .fill(isConnected ? Color.green : Color.red)
                 .frame(width: 8, height: 8)
-            Text(isConnected ? deviceName : "鏈繛鎺?)
+            Text(isConnected ? deviceName : "Not connected")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
