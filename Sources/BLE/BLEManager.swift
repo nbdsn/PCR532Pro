@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 import CoreBluetooth
 
 // MARK: - BLE Service & Characteristic UUIDs
@@ -6,19 +6,31 @@ struct PCR532BLE {
     /// Standard SPP-over-BLE service UUID (HM-10 / HC-08 compatible)
     static let serviceUUID = CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB")
     
-    /// Nordic UART Service (alternative, some devices use this)
+    /// Nordic UART Service
     static let nordicUARTServiceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
     
-    /// TX Characteristic (device → phone)
-    static let txCharacteristicUUID = CBUUID(string: "00001102-0000-1000-8000-00805F9B34FB")
-    static let nordicTXCharUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    /// Common transparent UART (JDY / HM-10 style FFE0/FFE1)
+    static let ffeServiceUUID = CBUUID(string: "0000FFE0-0000-1000-8000-00805F9B34FB")
+    static let ffeCharUUID = CBUUID(string: "0000FFE1-0000-1000-8000-00805F9B34FB")
     
-    /// RX Characteristic (phone → device)
-    static let rxCharacteristicUUID = CBUUID(string: "00001103-0000-1000-8000-00805F9B34FB")
-    static let nordicRXCharUUID = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+    /// Another common pair (FFF0)
+    static let fffServiceUUID = CBUUID(string: "0000FFF0-0000-1000-8000-00805F9B34FB")
+    static let fffCharUUID = CBUUID(string: "0000FFF1-0000-1000-8000-00805F9B34FB")
+    
+    /// Custom SPP TX/RX (legacy guess — rarely used by real modules)
+    static let customTxUUID = CBUUID(string: "00001102-0000-1000-8000-00805F9B34FB")
+    static let customRxUUID = CBUUID(string: "00001103-0000-1000-8000-00805F9B34FB")
+    
+    /// Nordic NUS: phone writes to RX, device notifies on TX
+    static let nordicRXCharUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E") // write
+    static let nordicTXCharUUID = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // notify
     
     /// Common name filters for device discovery
     static let nameFilters = ["PCR532", "PCR5", "HC-", "BLE", "UART", "BT05", "JDY"]
+    
+    static let knownServiceUUIDs: [CBUUID] = [
+        serviceUUID, nordicUARTServiceUUID, ffeServiceUUID, fffServiceUUID
+    ]
 }
 
 // MARK: - BLE Manager Delegate
@@ -43,10 +55,10 @@ struct BLEDevice: Identifiable, Equatable {
     }
     
     var signalStrength: String {
-        if rssi >= -50 { return "📶 强" }
-        if rssi >= -70 { return "📶 中" }
-        if rssi >= -85 { return "📶 弱" }
-        return "📶 极弱"
+        if rssi >= -50 { return "信号强" }
+        if rssi >= -70 { return "信号中" }
+        if rssi >= -85 { return "信号弱" }
+        return "信号极弱"
     }
     
     var signalBars: Int {
@@ -65,6 +77,7 @@ class BLEManager: NSObject, ObservableObject {
     @Published var connectedDeviceName = ""
     @Published var discoveredDevices = [BLEDevice]()
     @Published var connectionState: ConnectionState = .disconnected
+    @Published var lastErrorMessage: String?
     
     enum ConnectionState: String {
         case disconnected = "未连接"
@@ -77,14 +90,16 @@ class BLEManager: NSObject, ObservableObject {
     
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
-    private var txCharacteristic: CBCharacteristic?
-    private var rxCharacteristic: CBCharacteristic?
+    /// writeChar: phone → device
+    private var writeCharacteristic: CBCharacteristic?
+    /// notifyChar: device → phone
+    private var notifyCharacteristic: CBCharacteristic?
     private var responseBuffer = PN532ResponseBuffer()
     
-    // Async callbacks
     private var onFrameReceived: ((Result<PN532Frame, Error>) -> Void)?
     private var pendingAckCallback: (() -> Void)?
     private var ackTimer: DispatchSourceTimer?
+    private var discoveryFallbackUsed = false
     
     override init() {
         super.init()
@@ -102,15 +117,11 @@ class BLEManager: NSObject, ObservableObject {
         discoveredDevices.removeAll()
         isScanning = true
         
-        // Scan for SPP service and Nordic UART service
-        centralManager.scanForPeripherals(withServices: [
-            PCR532BLE.serviceUUID,
-            PCR532BLE.nordicUARTServiceUUID
-        ], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        centralManager.scanForPeripherals(withServices: PCR532BLE.knownServiceUUIDs,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
     
     func startScanAll() {
-        // Scan all peripherals (for devices that don't advertise the UART service)
         guard centralManager.state == .poweredOn else { return }
         discoveredDevices.removeAll()
         isScanning = true
@@ -125,6 +136,10 @@ class BLEManager: NSObject, ObservableObject {
     
     func connect(to device: BLEDevice) {
         connectionState = .connecting
+        lastErrorMessage = nil
+        discoveryFallbackUsed = false
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
         centralManager.connect(device.peripheral, options: nil)
         connectedPeripheral = device.peripheral
         connectedPeripheral?.delegate = self
@@ -138,25 +153,25 @@ class BLEManager: NSObject, ObservableObject {
     
     /// Send a PN532 frame and wait for the response
     func sendFrame(_ frame: PN532Frame) async throws -> PN532Frame {
-        guard let peripheral = connectedPeripheral, isConnected else {
+        guard let peripheral = connectedPeripheral else {
             throw PN532Error.notConnected
         }
-        guard let txChar = txCharacteristic else {
-            throw PN532Error.communicationError("TX 特征未找到")
+        guard connectionState == .ready, let writeChar = writeCharacteristic else {
+            throw PN532Error.communicationError("写特征未就绪（设备可能未完成服务发现）")
         }
         
         let rawData = frame.encode()
+        let writeType: CBCharacteristicWriteType =
+            writeChar.properties.contains(.writeWithoutResponse) && !writeChar.properties.contains(.write)
+            ? .withoutResponse : .withResponse
         
-        // Send data
-        peripheral.writeValue(Data(rawData), for: txChar, type: .withResponse)
+        peripheral.writeValue(Data(rawData), for: writeChar, type: writeType)
         
-        // Wait for response
         return try await withCheckedThrowingContinuation { continuation in
             self.onFrameReceived = { result in
                 continuation.resume(with: result)
             }
             
-            // Timeout after 5 seconds
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
                 if let callback = self?.onFrameReceived {
                     self?.onFrameReceived = nil
@@ -166,26 +181,16 @@ class BLEManager: NSObject, ObservableObject {
         }
     }
     
-    /// Send raw bytes (for debugging)
     func sendRaw(_ data: [UInt8]) {
-        guard let peripheral = connectedPeripheral, isConnected else { return }
-        guard let txChar = txCharacteristic else { return }
-        peripheral.writeValue(Data(data), for: txChar, type: .withResponse)
+        guard let peripheral = connectedPeripheral, connectionState == .ready else { return }
+        guard let writeChar = writeCharacteristic else { return }
+        let writeType: CBCharacteristicWriteType =
+            writeChar.properties.contains(.writeWithoutResponse) && !writeChar.properties.contains(.write)
+            ? .withoutResponse : .withResponse
+        peripheral.writeValue(Data(data), for: writeChar, type: writeType)
     }
     
     // MARK: - Internal
-    
-    private func setupAckTimer() {
-        cancelAckTimer()
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 3.0, repeating: .never)
-        timer.setEventHandler { [weak self] in
-            self?.pendingAckCallback = nil
-            self?.notifyFrame(.failure(PN532Error.timeout))
-        }
-        timer.resume()
-        ackTimer = timer
-    }
     
     private func cancelAckTimer() {
         ackTimer?.cancel()
@@ -208,11 +213,65 @@ class BLEManager: NSObject, ObservableObject {
                     delegate?.bleDidReceiveData(frame.data)
                     notifyFrame(.success(frame))
                 } else {
-                    break // Need more data
+                    break
                 }
             } catch {
                 notifyFrame(.failure(error))
                 break
+            }
+        }
+    }
+    
+    private func markReadyIfPossible() {
+        if writeCharacteristic != nil {
+            // notify optional for some modules; still mark ready so user can try
+            connectionState = .ready
+            isConnected = true
+            lastErrorMessage = nil
+        }
+    }
+    
+    private func assignCharacteristic(_ characteristic: CBCharacteristic, peripheral: CBPeripheral) {
+        let uuid = characteristic.uuid
+        let props = characteristic.properties
+        
+        // Prefer known UUID mapping
+        let isKnownWrite =
+            uuid == PCR532BLE.nordicRXCharUUID ||
+            uuid == PCR532BLE.customRxUUID ||
+            uuid == PCR532BLE.customTxUUID || // old wrong mapping may still be writeable
+            uuid == PCR532BLE.ffeCharUUID ||
+            uuid == PCR532BLE.fffCharUUID
+        
+        let isKnownNotify =
+            uuid == PCR532BLE.nordicTXCharUUID ||
+            uuid == PCR532BLE.customTxUUID ||
+            uuid == PCR532BLE.ffeCharUUID ||
+            uuid == PCR532BLE.fffCharUUID
+        
+        let canWrite = props.contains(.write) || props.contains(.writeWithoutResponse)
+        let canNotify = props.contains(.notify) || props.contains(.indicate)
+        
+        if canWrite && (isKnownWrite || writeCharacteristic == nil) {
+            // Prefer dedicated Nordic RX for write
+            if writeCharacteristic == nil || uuid == PCR532BLE.nordicRXCharUUID {
+                writeCharacteristic = characteristic
+            }
+        }
+        
+        if canNotify && (isKnownNotify || notifyCharacteristic == nil) {
+            if notifyCharacteristic == nil || uuid == PCR532BLE.nordicTXCharUUID {
+                notifyCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+        }
+        
+        // Single-char UART: same characteristic for write + notify
+        if canWrite && canNotify {
+            if writeCharacteristic == nil { writeCharacteristic = characteristic }
+            if notifyCharacteristic == nil {
+                notifyCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
             }
         }
     }
@@ -230,12 +289,10 @@ extension BLEManager: CBCentralManagerDelegate {
         let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "未知设备"
         let rssiValue = RSSI.intValue
         
-        // Filter out unnamed or irrelevant devices
         guard !name.isEmpty else { return }
         
         let device = BLEDevice(id: peripheral.identifier, name: name, rssi: rssiValue, peripheral: peripheral)
         
-        // Avoid duplicates
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
         } else {
@@ -247,18 +304,20 @@ extension BLEManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectionState = .discovering
-        isConnected = true
+        // Do NOT set isConnected until write characteristic is found
         connectedDeviceName = peripheral.name ?? "PCR532"
         delegate?.bleDidConnect(
             BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral)
         )
         
-        peripheral.discoverServices([PCR532BLE.serviceUUID, PCR532BLE.nordicUARTServiceUUID])
+        // First try known UART services; fallback to all services if empty
+        peripheral.discoverServices(PCR532BLE.knownServiceUUIDs)
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         connectionState = .disconnected
         isConnected = false
+        lastErrorMessage = error?.localizedDescription ?? "连接失败"
         delegate?.bleDidEncounterError(error ?? PN532Error.communicationError("连接失败"))
     }
     
@@ -266,8 +325,8 @@ extension BLEManager: CBCentralManagerDelegate {
         connectionState = .disconnected
         isConnected = false
         connectedDeviceName = ""
-        txCharacteristic = nil
-        rxCharacteristic = nil
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
         cancelAckTimer()
         
         delegate?.bleDidDisconnect(
@@ -280,44 +339,63 @@ extension BLEManager: CBCentralManagerDelegate {
 // MARK: - CBPeripheralDelegate
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
+        if let error = error {
+            lastErrorMessage = error.localizedDescription
+            delegate?.bleDidEncounterError(error)
+            return
+        }
+        
+        let services = peripheral.services ?? []
+        
+        if services.isEmpty {
+            if !discoveryFallbackUsed {
+                discoveryFallbackUsed = true
+                // Discover all services (some PCR532 clones hide custom UUIDs)
+                peripheral.discoverServices(nil)
+            } else {
+                lastErrorMessage = "未发现 BLE 服务"
+                connectionState = .disconnected
+                isConnected = false
+                delegate?.bleDidEncounterError(PN532Error.communicationError("未发现 BLE 服务"))
+            }
+            return
+        }
         
         for service in services {
-            let characteristicUUIDs: [CBUUID]
-            if service.uuid == PCR532BLE.serviceUUID {
-                characteristicUUIDs = [PCR532BLE.rxCharacteristicUUID, PCR532BLE.txCharacteristicUUID]
-            } else {
-                characteristicUUIDs = [PCR532BLE.nordicRXCharUUID, PCR532BLE.nordicTXCharUUID]
-            }
-            peripheral.discoverCharacteristics(characteristicUUIDs, for: service)
+            // Discover all characteristics on each service (more reliable than UUID filter)
+            peripheral.discoverCharacteristics(nil, for: service)
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error = error {
+            lastErrorMessage = error.localizedDescription
+            delegate?.bleDidEncounterError(error)
+            return
+        }
+        
         guard let characteristics = service.characteristics else { return }
         
         for characteristic in characteristics {
-            // Determine if this is TX (notify) or RX (write) characteristic
-            let isTX = characteristic.uuid == PCR532BLE.txCharacteristicUUID ||
-                       characteristic.uuid == PCR532BLE.nordicTXCharUUID
-            let isRX = characteristic.uuid == PCR532BLE.rxCharacteristicUUID ||
-                       characteristic.uuid == PCR532BLE.nordicRXCharUUID
-            
-            if isTX {
-                txCharacteristic = characteristic
-                peripheral.setNotifyValue(true, for: characteristic)
-            } else if isRX {
-                rxCharacteristic = characteristic
-            }
+            assignCharacteristic(characteristic, peripheral: peripheral)
         }
         
-        // Check if we have both characteristics
-        if txCharacteristic != nil && rxCharacteristic != nil {
-            connectionState = .ready
+        markReadyIfPossible()
+        
+        // If all services reported and still no write char, surface error
+        if writeCharacteristic == nil {
+            let remaining = (peripheral.services ?? []).contains { $0.characteristics == nil }
+            if !remaining {
+                lastErrorMessage = "未找到可写特征（请确认设备是否为 PCR532 蓝牙串口）"
+            }
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            delegate?.bleDidEncounterError(error)
+            return
+        }
         guard let value = characteristic.value else { return }
         let bytes = [UInt8](value)
         processReceivedData(bytes)
@@ -332,6 +410,7 @@ extension BLEManager: CBPeripheralDelegate {
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
+            lastErrorMessage = "订阅通知失败: \(error.localizedDescription)"
             delegate?.bleDidEncounterError(error)
         }
     }
