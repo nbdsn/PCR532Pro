@@ -2,7 +2,6 @@ import Foundation
 
 // MARK: - PN532 Command Codes
 struct PN532Command {
-    // System commands
     static let diagnose             = UInt8(0x00)
     static let getFirmwareVersion   = UInt8(0x02)
     static let readRegister         = UInt8(0x04)
@@ -11,29 +10,28 @@ struct PN532Command {
     static let writeGPIO            = UInt8(0x0E)
     static let setSerialBaudRate    = UInt8(0x10)
     static let setParameters        = UInt8(0x12)
-    static let rfConfiguration      = UInt8(0x14)
-    static let rfRegulationTest     = UInt8(0x58)
-    static let inRelease            = UInt8(0x18)
-    static let inJetPD              = UInt8(0x1A)
-    
-    // Initiator commands
+    static let samConfiguration     = UInt8(0x14) // RFConfiguration is 0x32? No:
+    // Official:
+    // SAMConfiguration = 0x14
+    // RFConfiguration = 0x32
+    static let rfConfiguration      = UInt8(0x32)
+    static let inRelease            = UInt8(0x52)
     static let inListPassiveTarget  = UInt8(0x4A)
     static let inDataExchange       = UInt8(0x40)
     static let inCommunicateThru    = UInt8(0x42)
-    static let inAutoPoll           = UInt8(0x54)
-    static let inSelect             = UInt8(0x50)
+    static let inAutoPoll           = UInt8(0x60)
+    static let inSelect             = UInt8(0x54)
     static let inDeselect           = UInt8(0x44)
-    static let inJumpForDEP         = UInt8(0x46)
-    static let inATR                = UInt8(0x50)
-    
-    // Target commands
-    static let tgInitAsTarget       = UInt8(0x2E)
-    static let tgGetData            = UInt8(0x32)
-    static let tgSetData            = UInt8(0x34)
-    static let tgSetGeneralBytes    = UInt8(0x30)
-    static let tgGetInitiatorCmd    = UInt8(0x38)
-    static let tgResponseToInit     = UInt8(0x3A)
 }
+
+// NOTE: Correct official codes:
+// SAMConfiguration = 0x14
+// RFConfiguration = 0x32
+// InListPassiveTarget = 0x4A
+// InDataExchange = 0x40
+// InCommunicateThru = 0x42
+// InAutoPoll = 0x60
+// InRelease = 0x52
 
 // MARK: - MIFARE Classic Commands
 struct MifareCommand {
@@ -42,196 +40,201 @@ struct MifareCommand {
     static let authKeyA             = UInt8(0x60)
     static let authKeyB             = UInt8(0x61)
     static let halt                 = UInt8(0x50)
-    static let getATS               = UInt8(0x40)
 }
 
 // MARK: - PN532 Command Builder
 struct PN532CommandBuilder {
     
-    // MARK: - System Commands
-    
-    /// Get firmware version
     static func getFirmwareVersion() -> PN532Frame {
         PN532Frame(tfi: .hostToPN532, data: [PN532Command.getFirmwareVersion])
     }
     
-    /// Read PN532 register
-    static func readRegister(_ address: UInt8) -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532, data: [PN532Command.readRegister, address])
+    /// SAMConfiguration mode=1 (normal), timeout=0x14, useIRQ=1
+    static func samConfiguration(mode: UInt8 = 0x01, timeout: UInt8 = 0x14, irq: UInt8 = 0x01) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x14, mode, timeout, irq])
     }
     
-    /// Write PN532 register
-    static func writeRegister(_ address: UInt8, value: UInt8) -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532, data: [PN532Command.writeRegister, address, value])
+    /// RFConfiguration item 0x01 MaxRetries: MxRtyATR, MxRtyPSL, MxRtyPassiveActivation
+    static func rfConfigurationMaxRetries(atr: UInt8 = 0xFF, psl: UInt8 = 0x01, passive: UInt8 = 0xFF) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x32, 0x05, atr, psl, passive])
     }
     
-    /// Set PN532 parameters
-    static func setParameters(_ params: [UInt8]) -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532, data: [PN532Command.setParameters] + params)
+    static func setParameters(_ params: UInt8) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x12, params])
     }
     
-    /// Configure RF
-    static func rfConfiguration(_ cfgType: UInt8, data: [UInt8]) -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532, data: [PN532Command.rfConfiguration, cfgType] + data)
-    }
-    
-    // MARK: - Card Detection
-    
-    /// Auto poll for cards (returns first detected)
     static func autoPoll(maxCards: UInt8 = 1, period: UInt8 = 1) -> PN532Frame {
-        // InAutoPoll: 0x54, maxCards, period, [pollType...]
-        // Poll types: 0x00=ISO14443A, 0x01=ISO14443B, 0x02=ISO18092
-        let pollTypes: [UInt8] = [0x00, 0x01, 0x02]
+        // InAutoPoll 0x60: maxTg, period (x150ms), type1...
+        let pollTypes: [UInt8] = [0x00] // 106kbps type A
         return PN532Frame(tfi: .hostToPN532,
-                         data: [PN532Command.inAutoPoll, maxCards, period] + pollTypes)
+                         data: [0x60, maxCards, period] + pollTypes)
     }
     
-    /// List passive targets (ISO14443A)
     static func listPassiveTarget(maxTargets: UInt8 = 1, baudRate: UInt8 = 0x00) -> PN532Frame {
-        // baudRate: 0x00=106kbps (MIFARE), 0x01=212kbps, 0x02=424kbps
         PN532Frame(tfi: .hostToPN532,
-                  data: [PN532Command.inListPassiveTarget, maxTargets, baudRate])
+                  data: [0x4A, maxTargets, baudRate])
     }
     
-    /// Release target
-    static func inRelease() -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532, data: [PN532Command.inRelease])
+    static func inRelease(target: UInt8 = 0x00) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x52, target])
     }
     
-    // MARK: - Data Exchange
-    
-    /// Exchange data with selected card (hardware handles auth)
-    /// - Parameters:
-    ///   - target: target number (usually 0x01 for first card)
-    ///   - mifareCmd: MIFARE command byte
-    ///   - data: command data
     static func inDataExchange(target: UInt8 = 0x01, mifareCmd: UInt8, data: [UInt8]) -> PN532Frame {
         PN532Frame(tfi: .hostToPN532,
-                  data: [PN532Command.inDataExchange, target, mifareCmd] + data)
+                  data: [0x40, target, mifareCmd] + data)
     }
     
-    /// Communicate directly with card (bypasses hardware auth)
-    /// Used for attacks (nested, darkside)
     static func inCommunicateThru(_ data: [UInt8]) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x42] + data)
+    }
+    
+    static func mifareAuthenticateA(target: UInt8 = 0x01, block: UInt8, key: [UInt8], uid: [UInt8]) -> PN532Frame {
+        // InDataExchange auth: 0x40, Tg, 0x60, block, key[6], uid[]
         PN532Frame(tfi: .hostToPN532,
-                  data: [PN532Command.inCommunicateThru] + data)
+                  data: [0x40, target, 0x60, block] + key + uid)
     }
     
-    // MARK: - MIFARE Convenience Helpers
-    
-    /// Authenticate with MIFARE Classic key A
-    static func mifareAuthenticateA(target: UInt8 = 0x01, block: UInt8, key: [UInt8]) -> PN532Frame {
-        inDataExchange(target: target, mifareCmd: MifareCommand.authKeyA, data: key + [block])
+    static func mifareAuthenticateB(target: UInt8 = 0x01, block: UInt8, key: [UInt8], uid: [UInt8]) -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532,
+                  data: [0x40, target, 0x61, block] + key + uid)
     }
     
-    /// Authenticate with MIFARE Classic key B
-    static func mifareAuthenticateB(target: UInt8 = 0x01, block: UInt8, key: [UInt8]) -> PN532Frame {
-        inDataExchange(target: target, mifareCmd: MifareCommand.authKeyB, data: key + [block])
-    }
-    
-    /// Read a block (must be authenticated first)
     static func mifareReadBlock(target: UInt8 = 0x01, block: UInt8) -> PN532Frame {
-        inDataExchange(target: target, mifareCmd: MifareCommand.read, data: [block])
+        PN532Frame(tfi: .hostToPN532, data: [0x40, target, 0x30, block])
     }
     
-    /// Write a block (must be authenticated first)
     static func mifareWriteBlock(target: UInt8 = 0x01, block: UInt8, data: [UInt8]) -> PN532Frame {
-        inDataExchange(target: target, mifareCmd: MifareCommand.write, data: [block] + data)
+        PN532Frame(tfi: .hostToPN532, data: [0x40, target, 0xA0, block] + data)
     }
     
-    /// Halt card
-    static func mifareHalt(target: UInt8 = 0x01) -> PN532Frame {
-        inCommunicateThru([MifareCommand.halt, 0x00])
+    static func mifareHalt() -> PN532Frame {
+        PN532Frame(tfi: .hostToPN532, data: [0x42, 0x50, 0x00])
     }
     
-    // MARK: - Raw MIFARE Commands (for InCommunicateThru - attacks)
-    
-    /// Raw auth command through InCommunicateThru
     static func rawMifareAuth(keyType: UInt8, block: UInt8, key: [UInt8]) -> [UInt8] {
-        // MIFARE auth command format: keyType (0x60/0x61), block, key (6 bytes)
         [keyType, block] + key
     }
     
-    /// Raw read command through InCommunicateThru
     static func rawMifareRead(block: UInt8) -> [UInt8] {
-        [MifareCommand.read, block]
+        [0x30, block]
     }
     
-    /// Raw write command through InCommunicateThru
     static func rawMifareWrite(block: UInt8, data: [UInt8]) -> [UInt8] {
-        [MifareCommand.write, block] + data
+        [0xA0, block] + data
     }
 }
 
 // MARK: - Response Parsing
 struct PN532ResponseParser {
     
-    /// Parse GetFirmwareVersion response
-    static func parseFirmware(_ data: [UInt8]) -> (ic: UInt8, ver: UInt8, rev: UInt8, support: UInt8) {
-        guard data.count >= 4 else { return (0, 0, 0, 0) }
-        return (data[0], data[1], data[2], data[3])
+    /// Strip response command byte (cmd+1) if present
+    static func stripResponseOpcode(_ data: [UInt8], requestCmd: UInt8) -> [UInt8] {
+        guard let first = data.first else { return data }
+        if first == requestCmd &+ 1 {
+            return Array(data.dropFirst())
+        }
+        return data
     }
     
-    /// Parse InListPassiveTarget response
-    /// Returns array of card info
+    static func parseFirmware(_ data: [UInt8]) -> (ic: UInt8, ver: UInt8, rev: UInt8, support: UInt8) {
+        let d = stripResponseOpcode(data, requestCmd: 0x02)
+        guard d.count >= 4 else { return (0, 0, 0, 0) }
+        return (d[0], d[1], d[2], d[3])
+    }
+    
+    /// Parse InListPassiveTarget / InAutoPoll type-A target list payload (after stripping opcode)
     static func parseTargetList(_ data: [UInt8]) -> [CardInfo] {
-        guard data.count >= 2, data[0] > 0 else { return [] }
+        // Accept both with and without response opcode 0x4B / 0x61
+        var body = data
+        if let first = body.first, first == 0x4B || first == 0x61 || first == 0x55 {
+            body = Array(body.dropFirst())
+        }
+        // InAutoPoll may include type/length wrappers; try simple path first
+        guard body.count >= 1 else { return [] }
         
-        let nbtg = data[0]
+        // For InAutoPoll 0x61 response: [nbr, type, len, ...target...]
+        // For InListPassiveTarget 0x4B: [NbTg, Tg, ATQA0, ATQA1, SAK, UIDLen, UID...]
+        // Heuristic: if body[0] is small (<=2) and body.count > 5 treat as NbTg list
+        let nbtg = Int(body[0])
+        guard nbtg > 0 else { return [] }
+        
         var cards = [CardInfo]()
         var offset = 1
         
-        for _ in 0..<nbtg {
-            guard offset + 1 < data.count else { break }
-            let tg = data[offset]; offset += 1
-            _ = tg // target number
-            guard offset + 2 < data.count else { break }
-            
-            let atqaHigh = data[offset]
-            let atqaLow = data[offset + 1]
-            offset += 2
-            
-            let sak = data[offset]; offset += 1
-            
-            guard offset < data.count else { break }
-            let uidLen = data[offset]; offset += 1
-            
-            guard offset + Int(uidLen) <= data.count else { break }
-            let uid = Array(data[offset..<offset + Int(uidLen)]); offset += Int(uidLen)
-            
-            // ATS (optional)
-            var ats: [UInt8]? = nil
-            if offset < data.count {
-                let atsLen = data[offset]; offset += 1
-                if atsLen > 0 && offset + Int(atsLen) - 1 <= data.count {
-                    ats = Array(data[offset..<offset + Int(atsLen) - 1])
-                    offset += Int(atsLen) - 1
-                }
+        // Detect AutoPoll envelope: after nbr comes type then len
+        if body.count > 3 && nbtg == 1 && body[1] <= 0x20 && Int(body[2]) + 3 <= body.count && body[2] >= 5 {
+            // AutoPoll style: skip type, use len
+            let type = body[1]
+            _ = type
+            let len = Int(body[2])
+            offset = 3
+            let target = Array(body[offset..<min(offset + len, body.count)])
+            if let card = parseOneISO14443A(target, hasTg: true) {
+                cards.append(card)
             }
-            
-            cards.append(CardInfo(
-                uid: uid, sak: sak,
-                atqa: (atqaHigh, atqaLow), ats: ats
-            ))
+            return cards
+        }
+        
+        for _ in 0..<nbtg {
+            if let (card, consumed) = parseOneISO14443AWithConsume(Array(body[offset...]), hasTg: true) {
+                cards.append(card)
+                offset += consumed
+            } else {
+                break
+            }
         }
         
         return cards
     }
     
-    /// Parse InDataExchange response
-    /// Returns: (success: Bool, data: [UInt8])
+    private static func parseOneISO14443A(_ data: [UInt8], hasTg: Bool) -> CardInfo? {
+        parseOneISO14443AWithConsume(data, hasTg: hasTg)?.0
+    }
+    
+    private static func parseOneISO14443AWithConsume(_ data: [UInt8], hasTg: Bool) -> (CardInfo, Int)? {
+        var offset = 0
+        if hasTg {
+            guard offset < data.count else { return nil }
+            offset += 1 // Tg
+        }
+        guard offset + 2 < data.count else { return nil }
+        let atqa0 = data[offset]
+        let atqa1 = data[offset + 1]
+        offset += 2
+        guard offset < data.count else { return nil }
+        let sak = data[offset]
+        offset += 1
+        guard offset < data.count else { return nil }
+        let uidLen = Int(data[offset])
+        offset += 1
+        guard offset + uidLen <= data.count else { return nil }
+        let uid = Array(data[offset..<offset + uidLen])
+        offset += uidLen
+        var ats: [UInt8]? = nil
+        if offset < data.count {
+            let atsLen = Int(data[offset])
+            offset += 1
+            if atsLen > 0 && offset + atsLen - 1 <= data.count {
+                ats = Array(data[offset..<offset + max(atsLen - 1, 0)])
+                offset += max(atsLen - 1, 0)
+            }
+        }
+        return (CardInfo(uid: uid, sak: sak, atqa: (atqa0, atqa1), ats: ats), offset)
+    }
+    
     static func parseDataExchange(_ data: [UInt8]) -> (Bool, [UInt8]) {
-        guard data.count >= 1 else { return (false, []) }
-        let status = data[0]
-        let responseData = data.count > 1 ? Array(data[1...]) : []
+        let d = stripResponseOpcode(data, requestCmd: 0x40)
+        guard d.count >= 1 else { return (false, []) }
+        let status = d[0]
+        let responseData = d.count > 1 ? Array(d[1...]) : []
         return (status == 0x00, responseData)
     }
     
-    /// Parse InCommunicateThru response
     static func parseCommunicateThru(_ data: [UInt8]) -> (Bool, [UInt8]) {
-        guard data.count >= 1 else { return (false, []) }
-        let status = data[0]
-        let responseData = data.count > 1 ? Array(data[1...]) : []
+        let d = stripResponseOpcode(data, requestCmd: 0x42)
+        guard d.count >= 1 else { return (false, []) }
+        let status = d[0]
+        let responseData = d.count > 1 ? Array(d[1...]) : []
         return (status == 0x00, responseData)
     }
 }

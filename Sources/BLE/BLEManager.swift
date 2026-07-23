@@ -3,25 +3,15 @@ import CoreBluetooth
 
 // MARK: - BLE Service & Characteristic UUIDs
 struct PCR532BLE {
-    /// Standard SPP-over-BLE service UUID (HM-10 / HC-08 compatible)
     static let serviceUUID = CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB")
-    
-    /// Nordic UART Service
     static let nordicUARTServiceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-    
-    /// Common transparent UART (JDY / HM-10 style FFE0/FFE1)
     static let ffeServiceUUID = CBUUID(string: "0000FFE0-0000-1000-8000-00805F9B34FB")
     static let ffeCharUUID = CBUUID(string: "0000FFE1-0000-1000-8000-00805F9B34FB")
-    
-    /// Another common pair (FFF0)
     static let fffServiceUUID = CBUUID(string: "0000FFF0-0000-1000-8000-00805F9B34FB")
     static let fffCharUUID = CBUUID(string: "0000FFF1-0000-1000-8000-00805F9B34FB")
-    
-    /// Custom SPP TX/RX (legacy)
     static let customTxUUID = CBUUID(string: "00001102-0000-1000-8000-00805F9B34FB")
     static let customRxUUID = CBUUID(string: "00001103-0000-1000-8000-00805F9B34FB")
-    
-    /// Nordic NUS: phone writes RX (002), device notifies TX (003)
+    /// Nordic NUS: write to 002 (RX), notify from 003 (TX)
     static let nordicRXCharUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
     static let nordicTXCharUUID = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
     
@@ -32,7 +22,6 @@ struct PCR532BLE {
     ]
 }
 
-// MARK: - BLE Manager Delegate
 protocol BLEManagerDelegate: AnyObject {
     func bleDidUpdateState(_ isPoweredOn: Bool)
     func bleDidDiscoverDevice(_ device: BLEDevice)
@@ -42,7 +31,6 @@ protocol BLEManagerDelegate: AnyObject {
     func bleDidEncounterError(_ error: Error)
 }
 
-// MARK: - BLE Device Model
 struct BLEDevice: Identifiable, Equatable {
     let id: UUID
     let name: String
@@ -51,13 +39,6 @@ struct BLEDevice: Identifiable, Equatable {
     
     static func == (lhs: BLEDevice, rhs: BLEDevice) -> Bool {
         lhs.id == rhs.id
-    }
-    
-    var signalStrength: String {
-        if rssi >= -50 { return "信号强" }
-        if rssi >= -70 { return "信号中" }
-        if rssi >= -85 { return "信号弱" }
-        return "信号极弱"
     }
     
     var signalBars: Int {
@@ -69,7 +50,6 @@ struct BLEDevice: Identifiable, Equatable {
     }
 }
 
-// MARK: - BLE Manager
 class BLEManager: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var isConnected = false
@@ -77,12 +57,13 @@ class BLEManager: NSObject, ObservableObject {
     @Published var discoveredDevices = [BLEDevice]()
     @Published var connectionState: ConnectionState = .disconnected
     @Published var lastErrorMessage: String?
+    @Published var lastDebugLog: String = ""
     
     enum ConnectionState: String {
-        case disconnected = "未连接"
-        case connecting = "连接中..."
-        case discovering = "发现服务..."
-        case ready = "已就绪"
+        case disconnected = "Not connected"
+        case connecting = "Connecting..."
+        case discovering = "Discovering..."
+        case ready = "Ready"
     }
     
     weak var delegate: BLEManagerDelegate?
@@ -94,31 +75,26 @@ class BLEManager: NSObject, ObservableObject {
     private var responseBuffer = PN532ResponseBuffer()
     
     private var onFrameReceived: ((Result<PN532Frame, Error>) -> Void)?
-    private var pendingAckCallback: (() -> Void)?
-    private var ackTimer: DispatchSourceTimer?
+    private var frameWaitContinuation: CheckedContinuation<PN532Frame, Error>?
+    private var expectingAckOnly = false
     private var discoveryFallbackUsed = false
-    /// When false, accept any named peripheral (needed for PCR532 modules that omit service UUIDs in ads)
-    private var filterByAdvertisedService = false
+    private var didInitPN532 = false
+    private var mtuChunkSize = 20
     
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: .main)
     }
     
-    // MARK: - Public API
-    
-    /// Default scan: scan ALL BLE devices. Most PCR532 clones do NOT put UART service UUID in advertising data.
     func startScan() {
         startScanAll()
     }
     
-    /// Optional: only peripherals advertising known UART service UUIDs
     func startScanFilteredByService() {
         guard centralManager.state == .poweredOn else {
-            delegate?.bleDidEncounterError(PN532Error.communicationError("蓝牙未开启"))
+            delegate?.bleDidEncounterError(PN532Error.communicationError("Bluetooth off"))
             return
         }
-        filterByAdvertisedService = true
         discoveredDevices.removeAll()
         isScanning = true
         centralManager.scanForPeripherals(
@@ -129,13 +105,11 @@ class BLEManager: NSObject, ObservableObject {
     
     func startScanAll() {
         guard centralManager.state == .poweredOn else {
-            delegate?.bleDidEncounterError(PN532Error.communicationError("蓝牙未开启"))
+            delegate?.bleDidEncounterError(PN532Error.communicationError("Bluetooth off"))
             return
         }
-        filterByAdvertisedService = false
         discoveredDevices.removeAll()
         isScanning = true
-        // nil = discover every advertising peripheral (required for HM-10/JDY/PCR532)
         centralManager.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -151,8 +125,10 @@ class BLEManager: NSObject, ObservableObject {
         connectionState = .connecting
         lastErrorMessage = nil
         discoveryFallbackUsed = false
+        didInitPN532 = false
         writeCharacteristic = nil
         notifyCharacteristic = nil
+        responseBuffer.clear()
         stopScan()
         centralManager.connect(device.peripheral, options: nil)
         connectedPeripheral = device.peripheral
@@ -161,78 +137,183 @@ class BLEManager: NSObject, ObservableObject {
     
     func disconnect() {
         guard let peripheral = connectedPeripheral else { return }
-        cancelAckTimer()
+        failPending(PN532Error.notConnected)
         centralManager.cancelPeripheralConnection(peripheral)
     }
     
-    func sendFrame(_ frame: PN532Frame) async throws -> PN532Frame {
+    /// Send PN532 command frame: wake + data, wait ACK, then wait response (skip ACKs)
+    func sendFrame(_ frame: PN532Frame, timeout: TimeInterval = 8.0) async throws -> PN532Frame {
         guard let peripheral = connectedPeripheral else {
             throw PN532Error.notConnected
         }
-        guard connectionState == .ready, let writeChar = writeCharacteristic else {
-            throw PN532Error.communicationError("写特征未就绪（设备可能未完成服务发现）")
+        guard connectionState == .ready, writeCharacteristic != nil else {
+            throw PN532Error.communicationError("Write characteristic not ready")
         }
         
-        let rawData = frame.encode()
-        let writeType: CBCharacteristicWriteType =
-            writeChar.properties.contains(.writeWithoutResponse) && !writeChar.properties.contains(.write)
-            ? .withoutResponse : .withResponse
+        // One-time init after connect
+        if !didInitPN532 {
+            try await initializePN532()
+        }
         
-        peripheral.writeValue(Data(rawData), for: writeChar, type: writeType)
+        responseBuffer.clear()
+        let raw = frame.encode()
+        appendDebug("TX \(raw.map { String(format: "%02X", $0) }.joined(separator: " "))")
         
-        return try await withCheckedThrowingContinuation { continuation in
-            self.onFrameReceived = { result in
-                continuation.resume(with: result)
-            }
-            
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-                if let callback = self?.onFrameReceived {
-                    self?.onFrameReceived = nil
-                    callback(.failure(PN532Error.timeout))
+        try await writeBytes(raw, peripheral: peripheral)
+        
+        // First complete frame is usually ACK; skip empty ACKs until data response
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { break }
+            do {
+                let resp = try await waitForNextFrame(timeout: remaining)
+                if resp.isAckPlaceholder {
+                    appendDebug("RX ACK")
+                    continue
                 }
+                if resp.tfi == .pn532ToHost {
+                    appendDebug("RX \(resp.data.map { String(format: "%02X", $0) }.joined(separator: " "))")
+                    return resp
+                }
+                // unexpected host frame - ignore
+            } catch let e as PN532Error {
+                if case .timeout = e { break }
+                throw e
             }
         }
+        throw PN532Error.timeout
     }
     
     func sendRaw(_ data: [UInt8]) {
         guard let peripheral = connectedPeripheral, connectionState == .ready else { return }
-        guard let writeChar = writeCharacteristic else { return }
+        Task { try? await writeBytes(data, peripheral: peripheral) }
+    }
+    
+    // MARK: - PN532 init sequence
+    
+    private func initializePN532() async throws {
+        guard let peripheral = connectedPeripheral else { throw PN532Error.notConnected }
+        
+        // Wake-up preamble for HSU/UART modules
+        try await writeBytes(PN532Frame.wakeUp, peripheral: peripheral)
+        try await Task.sleep(nanoseconds: 80_000_000)
+        
+        // SAMConfiguration normal mode
+        responseBuffer.clear()
+        let sam = PN532CommandBuilder.samConfiguration()
+        try await writeBytes(sam.encode(), peripheral: peripheral)
+        _ = try? await waitForAckThenResponse(timeout: 3.0) // may timeout on some firmwares
+        
+        // GetFirmwareVersion to verify link
+        responseBuffer.clear()
+        let fw = PN532CommandBuilder.getFirmwareVersion()
+        try await writeBytes(fw.encode(), peripheral: peripheral)
+        if let resp = try? await waitForAckThenResponse(timeout: 4.0) {
+            let info = PN532ResponseParser.parseFirmware(resp.data)
+            appendDebug(String(format: "FW IC=%02X ver=%d.%d", info.ic, info.ver, info.rev))
+            didInitPN532 = true
+            return
+        }
+        
+        // Retry wake + firmware once
+        try await writeBytes(PN532Frame.wakeUp, peripheral: peripheral)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        responseBuffer.clear()
+        try await writeBytes(fw.encode(), peripheral: peripheral)
+        if let resp = try? await waitForAckThenResponse(timeout: 4.0) {
+            let info = PN532ResponseParser.parseFirmware(resp.data)
+            appendDebug(String(format: "FW retry IC=%02X", info.ic))
+            didInitPN532 = true
+            return
+        }
+        
+        // Still mark init attempted so detect can run; some bridges auto-wake
+        didInitPN532 = true
+        appendDebug("Init: no firmware response (continue)")
+    }
+    
+    private func waitForAckThenResponse(timeout: TimeInterval) async throws -> PN532Frame {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let remaining = deadline.timeIntervalSinceNow
+            let resp = try await waitForNextFrame(timeout: max(remaining, 0.05))
+            if resp.isAckPlaceholder { continue }
+            if resp.tfi == .pn532ToHost { return resp }
+        }
+        throw PN532Error.timeout
+    }
+    
+    private func waitForNextFrame(timeout: TimeInterval) async throws -> PN532Frame {
+        // Drain already buffered frames first
+        if let frame = try responseBuffer.extractFrame() {
+            return frame
+        }
+        
+        return try await withCheckedThrowingContinuation { cont in
+            self.frameWaitContinuation = cont
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self = self else { return }
+                if let c = self.frameWaitContinuation {
+                    self.frameWaitContinuation = nil
+                    c.resume(throwing: PN532Error.timeout)
+                }
+            }
+        }
+    }
+    
+    private func failPending(_ error: Error) {
+        if let c = frameWaitContinuation {
+            frameWaitContinuation = nil
+            c.resume(throwing: error)
+        }
+    }
+    
+    private func deliverBufferedFrames() {
+        do {
+            while let frame = try responseBuffer.extractFrame() {
+                if let c = frameWaitContinuation {
+                    frameWaitContinuation = nil
+                    c.resume(returning: frame)
+                    return
+                } else {
+                    // No waiter: drop ACKs, keep only if someone later... already consumed
+                    break
+                }
+            }
+        } catch {
+            if let c = frameWaitContinuation {
+                frameWaitContinuation = nil
+                c.resume(throwing: error)
+            }
+        }
+    }
+    
+    private func writeBytes(_ data: [UInt8], peripheral: CBPeripheral) async throws {
+        guard let writeChar = writeCharacteristic else {
+            throw PN532Error.communicationError("No write char")
+        }
         let writeType: CBCharacteristicWriteType =
             writeChar.properties.contains(.writeWithoutResponse) && !writeChar.properties.contains(.write)
             ? .withoutResponse : .withResponse
-        peripheral.writeValue(Data(data), for: writeChar, type: writeType)
-    }
-    
-    // MARK: - Internal
-    
-    private func cancelAckTimer() {
-        ackTimer?.cancel()
-        ackTimer = nil
-    }
-    
-    private func notifyFrame(_ result: Result<PN532Frame, Error>) {
-        if let callback = onFrameReceived {
-            onFrameReceived = nil
-            callback(result)
-        }
-    }
-    
-    private func processReceivedData(_ data: [UInt8]) {
-        responseBuffer.append(data)
         
-        while true {
-            do {
-                if let frame = try responseBuffer.extractFrame() {
-                    delegate?.bleDidReceiveData(frame.data)
-                    notifyFrame(.success(frame))
-                } else {
-                    break
-                }
-            } catch {
-                notifyFrame(.failure(error))
-                break
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + mtuChunkSize, data.count)
+            let chunk = Array(data[offset..<end])
+            peripheral.writeValue(Data(chunk), for: writeChar, type: writeType)
+            offset = end
+            if offset < data.count {
+                // small gap for cheap BLE UART modules
+                try await Task.sleep(nanoseconds: 15_000_000)
             }
         }
+        // allow notify path to settle
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    
+    private func appendDebug(_ s: String) {
+        lastDebugLog = s
     }
     
     private func markReadyIfPossible() {
@@ -246,36 +327,33 @@ class BLEManager: NSObject, ObservableObject {
     private func assignCharacteristic(_ characteristic: CBCharacteristic, peripheral: CBPeripheral) {
         let uuid = characteristic.uuid
         let props = characteristic.properties
+        let canWrite = props.contains(.write) || props.contains(.writeWithoutResponse)
+        let canNotify = props.contains(.notify) || props.contains(.indicate)
         
-        let isKnownWrite =
+        let preferWrite =
             uuid == PCR532BLE.nordicRXCharUUID ||
             uuid == PCR532BLE.customRxUUID ||
-            uuid == PCR532BLE.customTxUUID ||
             uuid == PCR532BLE.ffeCharUUID ||
-            uuid == PCR532BLE.fffCharUUID
+            uuid == PCR532BLE.fffCharUUID ||
+            uuid == PCR532BLE.customTxUUID
         
-        let isKnownNotify =
+        let preferNotify =
             uuid == PCR532BLE.nordicTXCharUUID ||
             uuid == PCR532BLE.customTxUUID ||
             uuid == PCR532BLE.ffeCharUUID ||
             uuid == PCR532BLE.fffCharUUID
         
-        let canWrite = props.contains(.write) || props.contains(.writeWithoutResponse)
-        let canNotify = props.contains(.notify) || props.contains(.indicate)
-        
-        if canWrite && (isKnownWrite || writeCharacteristic == nil) {
-            if writeCharacteristic == nil || uuid == PCR532BLE.nordicRXCharUUID {
+        if canWrite {
+            if writeCharacteristic == nil || preferWrite {
                 writeCharacteristic = characteristic
             }
         }
-        
-        if canNotify && (isKnownNotify || notifyCharacteristic == nil) {
-            if notifyCharacteristic == nil || uuid == PCR532BLE.nordicTXCharUUID {
+        if canNotify {
+            if notifyCharacteristic == nil || preferNotify {
                 notifyCharacteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
             }
         }
-        
         if canWrite && canNotify {
             if writeCharacteristic == nil { writeCharacteristic = characteristic }
             if notifyCharacteristic == nil {
@@ -286,62 +364,46 @@ class BLEManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - CBCentralManagerDelegate
 extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        let poweredOn = central.state == .poweredOn
-        delegate?.bleDidUpdateState(poweredOn)
+        delegate?.bleDidUpdateState(central.state == .poweredOn)
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                        advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheral.name ?? advertisedName ?? ""
-        let rssiValue = RSSI.intValue
-        
-        // Keep unnamed only if it advertises a known service (rare but possible)
         let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let hasKnownService = serviceUUIDs.contains { PCR532BLE.knownServiceUUIDs.contains($0) }
+        if name.isEmpty && !hasKnownService { return }
         
-        if name.isEmpty && !hasKnownService {
-            return
-        }
-        
-        let displayName = name.isEmpty ? "未命名设备" : name
-        let device = BLEDevice(
-            id: peripheral.identifier,
-            name: displayName,
-            rssi: rssiValue,
-            peripheral: peripheral
-        )
-        
+        let displayName = name.isEmpty ? "Unknown" : name
+        let device = BLEDevice(id: peripheral.identifier, name: displayName, rssi: RSSI.intValue, peripheral: peripheral)
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index] = device
         } else {
             discoveredDevices.append(device)
-            // Sort by signal strength
             discoveredDevices.sort { $0.rssi > $1.rssi }
         }
-        
         delegate?.bleDidDiscoverDevice(device)
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectionState = .discovering
         connectedDeviceName = peripheral.name ?? "PCR532"
-        delegate?.bleDidConnect(
-            BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral)
-        )
-        
-        // Prefer known services first; fallback discovers all if empty
-        peripheral.discoverServices(PCR532BLE.knownServiceUUIDs)
+        let maxLen = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        if maxLen > 0 {
+            mtuChunkSize = max(20, min(maxLen, 180))
+        }
+        delegate?.bleDidConnect(BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral))
+        peripheral.discoverServices(nil)
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         connectionState = .disconnected
         isConnected = false
-        lastErrorMessage = error?.localizedDescription ?? "连接失败"
-        delegate?.bleDidEncounterError(error ?? PN532Error.communicationError("连接失败"))
+        lastErrorMessage = error?.localizedDescription ?? "Connect failed"
+        delegate?.bleDidEncounterError(error ?? PN532Error.communicationError("Connect failed"))
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -350,8 +412,8 @@ extension BLEManager: CBCentralManagerDelegate {
         connectedDeviceName = ""
         writeCharacteristic = nil
         notifyCharacteristic = nil
-        cancelAckTimer()
-        
+        didInitPN532 = false
+        failPending(PN532Error.notConnected)
         delegate?.bleDidDisconnect(
             BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral),
             error: error
@@ -359,7 +421,6 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 }
 
-// MARK: - CBPeripheralDelegate
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error = error {
@@ -367,22 +428,13 @@ extension BLEManager: CBPeripheralDelegate {
             delegate?.bleDidEncounterError(error)
             return
         }
-        
         let services = peripheral.services ?? []
-        
         if services.isEmpty {
-            if !discoveryFallbackUsed {
-                discoveryFallbackUsed = true
-                peripheral.discoverServices(nil)
-            } else {
-                lastErrorMessage = "未发现 BLE 服务"
-                connectionState = .disconnected
-                isConnected = false
-                delegate?.bleDidEncounterError(PN532Error.communicationError("未发现 BLE 服务"))
-            }
+            lastErrorMessage = "No BLE services"
+            connectionState = .disconnected
+            isConnected = false
             return
         }
-        
         for service in services {
             peripheral.discoverCharacteristics(nil, for: service)
         }
@@ -391,22 +443,16 @@ extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error = error {
             lastErrorMessage = error.localizedDescription
-            delegate?.bleDidEncounterError(error)
             return
         }
-        
-        guard let characteristics = service.characteristics else { return }
-        
-        for characteristic in characteristics {
+        for characteristic in service.characteristics ?? [] {
             assignCharacteristic(characteristic, peripheral: peripheral)
         }
-        
         markReadyIfPossible()
-        
         if writeCharacteristic == nil {
             let remaining = (peripheral.services ?? []).contains { $0.characteristics == nil }
             if !remaining {
-                lastErrorMessage = "未找到可写特征（请确认设备是否为 PCR532 蓝牙串口）"
+                lastErrorMessage = "No writable characteristic"
             }
         }
     }
@@ -416,21 +462,29 @@ extension BLEManager: CBPeripheralDelegate {
             delegate?.bleDidEncounterError(error)
             return
         }
-        guard let value = characteristic.value else { return }
-        processReceivedData([UInt8](value))
+        guard let value = characteristic.value, !value.isEmpty else { return }
+        let bytes = [UInt8](value)
+        appendDebug("NOTIFY \(bytes.map { String(format: "%02X", $0) }.joined(separator: " "))")
+        responseBuffer.append(bytes)
+        deliverBufferedFrames()
+        delegate?.bleDidReceiveData(bytes)
     }
     
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             delegate?.bleDidEncounterError(error)
-            notifyFrame(.failure(error))
+            failPending(error)
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            lastErrorMessage = "订阅通知失败: \(error.localizedDescription)"
-            delegate?.bleDidEncounterError(error)
+            lastErrorMessage = "Notify failed: \(error.localizedDescription)"
         }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        // rediscover
+        peripheral.discoverServices(nil)
     }
 }

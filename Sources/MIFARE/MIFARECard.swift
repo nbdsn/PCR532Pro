@@ -227,49 +227,42 @@ class MIFAREController: ObservableObject {
     
     /// Detect card and get UID/SAK/ATQA
     func detectCard() async throws -> CardInfo {
-        statusMessage = "检测卡片..."
+        statusMessage = "Detecting card..."
         
-        // Auto poll for cards
-        let pollFrame = PN532CommandBuilder.autoPoll(maxCards: 1, period: 2)
-        let pollResponse = try await bleManager.sendFrame(pollFrame)
-        
-        // Parse response
-        guard pollResponse.data.count >= 1 else {
-            throw PN532Error.noCardPresent
+        // Prefer InListPassiveTarget (standard, reliable on PN532 UART bridges)
+        do {
+            let listFrame = PN532CommandBuilder.listPassiveTarget(maxTargets: 1, baudRate: 0x00)
+            let response = try await bleManager.sendFrame(listFrame, timeout: 10.0)
+            let cards = PN532ResponseParser.parseTargetList(response.data)
+            if let card = cards.first {
+                await MainActor.run {
+                    currentCard = card
+                    statusMessage = "Found: \(card.typeDescription) (UID: \(card.uidString))"
+                }
+                return card
+            }
+        } catch {
+            // fall through to auto poll
+            statusMessage = "Retry with AutoPoll..."
         }
         
-        let nbtg = pollResponse.data[0]
-        guard nbtg > 0 else {
-            throw PN532Error.noCardPresent
-        }
-        
-        // Parse target data
-        // InAutoPoll response includes the target data same as InListPassiveTarget
+        let pollFrame = PN532CommandBuilder.autoPoll(maxCards: 1, period: 1)
+        let pollResponse = try await bleManager.sendFrame(pollFrame, timeout: 12.0)
         let cards = PN532ResponseParser.parseTargetList(pollResponse.data)
         guard let card = cards.first else {
             throw PN532Error.noCardPresent
         }
         
-        currentCard = card
-        statusMessage = "检测到: \(card.typeDescription) (UID: \(card.uidString))"
+        await MainActor.run {
+            currentCard = card
+            statusMessage = "Found: \(card.typeDescription) (UID: \(card.uidString))"
+        }
         return card
     }
     
-    /// Detect card using InListPassiveTarget (more control)
+    /// Detect card using InListPassiveTarget
     func detectCardDirect() async throws -> CardInfo {
-        statusMessage = "检测卡片..."
-        
-        let listFrame = PN532CommandBuilder.listPassiveTarget(maxTargets: 1, baudRate: 0x00)
-        let response = try await bleManager.sendFrame(listFrame)
-        
-        let cards = PN532ResponseParser.parseTargetList(response.data)
-        guard let card = cards.first else {
-            throw PN532Error.noCardPresent
-        }
-        
-        currentCard = card
-        statusMessage = "检测到: \(card.typeDescription) (UID: \(card.uidString))"
-        return card
+        try await detectCard()
     }
     
     // MARK: - Authentication

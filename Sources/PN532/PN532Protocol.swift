@@ -1,5 +1,4 @@
 import Foundation
-import CoreBluetooth
 
 // MARK: - PN532 Error
 enum PN532Error: LocalizedError {
@@ -18,164 +17,168 @@ enum PN532Error: LocalizedError {
     
     var errorDescription: String? {
         switch self {
-        case .invalidResponse: return "无效响应"
-        case .ackFailed: return "ACK 确认失败"
-        case .nackReceived: return "NACK 拒绝"
-        case .timeout: return "通信超时"
-        case .notConnected: return "设备未连接"
-        case .noCardPresent: return "未检测到卡片"
-        case .authFailed: return "认证失败"
-        case .invalidFrame: return "无效数据帧"
-        case .communicationError(let s): return "通信错误: \(s)"
-        case .hardwareError(let c): return "硬件错误码: 0x\(String(format: "%02X", c))"
-        case .cardRemoved: return "卡片已移除"
-        case .unknownError: return "未知错误"
+        case .invalidResponse: return "Invalid response"
+        case .ackFailed: return "ACK failed"
+        case .nackReceived: return "NACK"
+        case .timeout: return "Communication timeout"
+        case .notConnected: return "Device not connected"
+        case .noCardPresent: return "No card detected"
+        case .authFailed: return "Auth failed"
+        case .invalidFrame: return "Invalid frame"
+        case .communicationError(let s): return "Comm error: \(s)"
+        case .hardwareError(let c): return "HW error: 0x\(String(format: "%02X", c))"
+        case .cardRemoved: return "Card removed"
+        case .unknownError: return "Unknown error"
         }
     }
 }
 
 // MARK: - PN532 Frame
 struct PN532Frame {
-    /// TFI (Transport Frame Identifier)
     enum TFI: UInt8 {
-        case hostToPN532 = 0xD4   // 主机 → PN532
-        case pn532ToHost = 0xD5   // PN532 → 主机
+        case hostToPN532 = 0xD4
+        case pn532ToHost = 0xD5
     }
     
-    /// ACK frame bytes
     static let ack: [UInt8] = [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]
-    
-    /// NACK frame bytes
     static let nack: [UInt8] = [0x00, 0x00, 0xFF, 0x01, 0xFE, 0x00]
-    
-    /// Error response TFI
+    /// HSU wake-up: long preamble so PN532 exits low power
+    static let wakeUp: [UInt8] = [
+        0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
     static let errorTFI: UInt8 = 0x7F
     
     let tfi: TFI
     let data: [UInt8]
     
-    /// Encode frame to raw bytes for BLE transmission
+    var isAckPlaceholder: Bool {
+        tfi == .hostToPN532 && data.isEmpty
+    }
+    
     func encode() -> [UInt8] {
         var frame = [UInt8]()
         let payload = [tfi.rawValue] + data
         let len = payload.count
         
-        // Extended frame if data > 254 bytes
         if len > 254 {
-            // Extended length (3 bytes: 0xFF, 0xFF, extended len)
             let extLen = UInt16(len)
-            let lcsHigh = UInt16(0xFFFF) &- extLen
             let sum = payload.reduce(0) { UInt16($0) + UInt16($1) }
             let dcs = UInt8((0x0100 - (sum & 0xFF)) & 0xFF)
             
-            frame.append(contentsOf: [0x00, 0x00, 0xFF])  // Preamble + Start
-            frame.append(0xFF); frame.append(0xFF)          // Extended length marker
-            frame.append(UInt8((extLen >> 8) & 0xFF))       // Extended len high
-            frame.append(UInt8(extLen & 0xFF))              // Extended len low
-            frame.append(UInt8((lcsHigh >> 8) & 0xFF))      // LCS high
-            frame.append(UInt8(lcsHigh & 0xFF))             // LCS low
-            frame.append(contentsOf: payload)               // TFI + Data
-            frame.append(dcs)                                // DCS
-            frame.append(0x00)                               // Postamble
+            frame.append(contentsOf: [0x00, 0x00, 0xFF])
+            frame.append(0xFF); frame.append(0xFF)
+            frame.append(UInt8((extLen >> 8) & 0xFF))
+            frame.append(UInt8(extLen & 0xFF))
+            // Extended LCS: 0x10000 - extLen (two bytes, low 8 of each complement style)
+            let lcs = UInt16(0x10000) &- extLen
+            frame.append(UInt8((lcs >> 8) & 0xFF))
+            frame.append(UInt8(lcs & 0xFF))
+            frame.append(contentsOf: payload)
+            frame.append(dcs)
+            frame.append(0x00)
         } else {
             let lcs = (0x0100 - UInt16(len)) & 0xFF
             let sum = payload.reduce(0) { $0 &+ $1 }
             let dcs = (0x0100 - UInt16(sum)) & 0xFF
             
-            frame.append(contentsOf: [0x00, 0x00, 0xFF])  // Preamble + Start
-            frame.append(UInt8(len))                       // Length
-            frame.append(UInt8(lcs))                       // LCS
-            frame.append(contentsOf: payload)              // TFI + Data
-            frame.append(UInt8(dcs))                       // DCS
-            frame.append(0x00)                             // Postamble
+            // Single preamble 0x00 is enough; many modules also accept 0x00 0x00 0xFF
+            frame.append(contentsOf: [0x00, 0x00, 0xFF])
+            frame.append(UInt8(len))
+            frame.append(UInt8(lcs))
+            frame.append(contentsOf: payload)
+            frame.append(UInt8(dcs))
+            frame.append(0x00)
         }
         
         return frame
     }
     
-    /// Parse raw bytes into a frame, returning the frame and remaining bytes
     static func parse(_ bytes: [UInt8]) throws -> (frame: PN532Frame, consumed: Int) {
         guard bytes.count >= 6 else { throw PN532Error.invalidFrame }
         
         var offset = 0
         
-        // Check for ACK
+        // Skip leading zeros (but keep structure for ACK)
         if bytes.starts(with: ack) {
             return (PN532Frame(tfi: .hostToPN532, data: []), ack.count)
         }
-        
-        // Check for NACK
         if bytes.starts(with: nack) {
             throw PN532Error.nackReceived
         }
         
-        // Skip preamble (multiple 0x00)
-        while offset < bytes.count && bytes[offset] == 0x00 {
+        // Find 0x00 0xFF start code (allow 0 or more preamble 0x00)
+        while offset + 1 < bytes.count {
+            if bytes[offset] == 0x00 && bytes[offset + 1] == 0xFF {
+                break
+            }
+            if bytes[offset] == 0x00 {
+                offset += 1
+                continue
+            }
+            // skip junk
             offset += 1
         }
-        
-        // Need at least start bytes
-        guard offset + 2 < bytes.count else { throw PN532Error.invalidFrame }
-        guard bytes[offset] == 0x00 && bytes[offset + 1] == 0xFF else {
+        guard offset + 1 < bytes.count, bytes[offset] == 0x00, bytes[offset + 1] == 0xFF else {
             throw PN532Error.invalidFrame
         }
         offset += 2
         
-        // Read length
+        guard offset < bytes.count else { throw PN532Error.invalidFrame }
         let len = bytes[offset]
         offset += 1
         
-        var payloadLength: Int
-        var dcsIndex: Int
-        
+        let payloadLength: Int
         if len == 0xFF {
-            // Extended frame
-            guard offset + 1 < bytes.count else { throw PN532Error.invalidFrame }
-            let extLenHigh = bytes[offset]
-            let extLenLow = bytes[offset + 1]
-            let extLen = (UInt16(extLenHigh) << 8) | UInt16(extLenLow)
-            offset += 2
-            
-            // Extended LCS
-            guard offset + 1 < bytes.count else { throw PN532Error.invalidFrame }
-            offset += 2 // Skip extended LCS
-            
-            payloadLength = Int(extLen)
-            dcsIndex = offset + payloadLength
+            // Could be ACK length? Normal ACK is LEN=0 not 0xFF.
+            // Extended frame: next two bytes may be 0xFF 0xFF marker already consumed? Standard:
+            // 00 00 FF FF FF LENm LENl LCS ...
+            // After start 00 FF, first len byte 0xFF means extended if next is 0xFF
+            guard offset < bytes.count else { throw PN532Error.invalidFrame }
+            if bytes[offset] == 0xFF {
+                offset += 1
+                guard offset + 1 < bytes.count else { throw PN532Error.invalidFrame }
+                let extLen = (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+                offset += 2
+                guard offset + 1 < bytes.count else { throw PN532Error.invalidFrame }
+                offset += 2 // skip LCS
+                payloadLength = Int(extLen)
+            } else {
+                // Normal frame with len=0xFF is invalid for standard; treat as incomplete
+                throw PN532Error.invalidFrame
+            }
+        } else if len == 0x00 {
+            // ACK: 00 00 FF 00 FF 00
+            guard offset < bytes.count else { throw PN532Error.invalidFrame }
+            let lcs = bytes[offset]
+            offset += 1
+            guard lcs == 0xFF else { throw PN532Error.invalidFrame }
+            // optional postamble
+            var consumed = offset
+            if consumed < bytes.count && bytes[consumed] == 0x00 { consumed += 1 }
+            return (PN532Frame(tfi: .hostToPN532, data: []), consumed)
         } else {
-            // Normal frame: read LCS
             guard offset < bytes.count else { throw PN532Error.invalidFrame }
             let lcs = bytes[offset]
             let expectedLcs = (0x0100 - UInt16(len)) & 0xFF
-            guard UInt8(expectedLcs) == lcs else {
-                throw PN532Error.invalidFrame
-            }
+            guard UInt8(expectedLcs) == lcs else { throw PN532Error.invalidFrame }
             offset += 1
-            
             payloadLength = Int(len)
-            dcsIndex = offset + payloadLength
         }
         
-        // Read payload
-        guard dcsIndex <= bytes.count else { throw PN532Error.invalidFrame }
-        let payload = Array(bytes[offset..<dcsIndex])
-        
-        // Verify DCS
+        let dcsIndex = offset + payloadLength
         guard dcsIndex < bytes.count else { throw PN532Error.invalidFrame }
+        let payload = Array(bytes[offset..<dcsIndex])
         let dcs = bytes[dcsIndex]
         let sum = payload.reduce(0) { $0 &+ $1 }
         let expectedDcs = (0x0100 - UInt16(sum)) & 0xFF
-        guard UInt8(expectedDcs) == dcs else {
-            throw PN532Error.invalidFrame
-        }
+        guard UInt8(expectedDcs) == dcs else { throw PN532Error.invalidFrame }
         
-        // Check for error TFI
         if payload.first == errorTFI {
             let errorCode = payload.count > 1 ? payload[1] : 0
             throw PN532Error.hardwareError(errorCode)
         }
         
-        // Determine TFI
         guard let firstByte = payload.first else { throw PN532Error.invalidFrame }
         let tfi: TFI
         if firstByte == TFI.hostToPN532.rawValue {
@@ -207,44 +210,46 @@ class PN532ResponseBuffer {
         append([UInt8](data))
     }
     
-    /// Try to extract a complete frame from the buffer
+    /// Extract next complete frame. ACK frames have empty data + hostToPN532.
     func extractFrame() throws -> PN532Frame? {
         guard buffer.count >= 6 else { return nil }
         
-        // Check for ACK first
-        if buffer.starts(with: PN532Frame.ack) {
-            buffer.removeFirst(PN532Frame.ack.count)
-            return PN532Frame(tfi: .hostToPN532, data: [])
-        }
-        
-        // Try to parse a frame starting at current position
-        // First skip any stray bytes before 0x0000FF
+        // Align to possible frame start
         var startOffset = 0
         while startOffset < buffer.count - 2 {
-            if buffer[startOffset] == 0x00 && buffer[startOffset + 1] == 0x00 && buffer[startOffset + 2] == 0xFF {
+            if buffer[startOffset] == 0x00 && startOffset + 1 < buffer.count && buffer[startOffset + 1] == 0x00 &&
+                startOffset + 2 < buffer.count && buffer[startOffset + 2] == 0xFF {
+                break
+            }
+            if buffer[startOffset] == 0x00 && startOffset + 1 < buffer.count && buffer[startOffset + 1] == 0xFF {
                 break
             }
             startOffset += 1
         }
         
-        guard startOffset < buffer.count - 2 else {
-            // No valid start found, clear if too much junk
-            if buffer.count > 50 { buffer.removeAll() }
-            return nil
-        }
-        
         if startOffset > 0 {
+            if startOffset >= buffer.count {
+                buffer.removeAll()
+                return nil
+            }
             buffer.removeFirst(startOffset)
         }
         
+        guard buffer.count >= 6 else { return nil }
+        
         do {
             let (frame, consumed) = try PN532Frame.parse(buffer)
-            buffer.removeFirst(consumed)
+            if consumed > 0 && consumed <= buffer.count {
+                buffer.removeFirst(consumed)
+            }
             return frame
+        } catch PN532Error.invalidFrame {
+            // incomplete
+            return nil
         } catch {
-            // If parse failed and we have enough data, clear and retry
-            if buffer.count > 256 {
-                buffer.removeFirst(6) // Remove minimal possible frame size
+            // NACK / hardware — drop minimal and rethrow
+            if buffer.count > 6 {
+                buffer.removeFirst(1)
             }
             throw error
         }
@@ -277,11 +282,10 @@ struct CardInfo {
         case 0x00: return "MIFARE Ultralight"
         case 0x44: return "MIFARE DESFire"
         case 0x34: return "MIFARE DESFire 8K"
-        case 0x10..<0x20: return "MIFARE Plus"
         default:
-            if uid.count == 4 { return "MIFARE Classic (4字节 UID)" }
-            if uid.count == 7 { return "MIFARE Classic (7字节 UID)" }
-            return "未知卡片 (SAK: 0x\(String(format: "%02X", sak)))"
+            if uid.count == 4 { return "MIFARE Classic (4-byte UID)" }
+            if uid.count == 7 { return "MIFARE Classic (7-byte UID)" }
+            return "Unknown (SAK: 0x\(String(format: "%02X", sak)))"
         }
     }
     
@@ -295,18 +299,18 @@ struct CardInfo {
     
     var totalSectors: Int {
         switch sak {
-        case 0x08, 0x09: return 16   // 1K
-        case 0x18: return 40          // 4K
-        case 0x28, 0x38: return 40    // Plus
+        case 0x08, 0x09: return 16
+        case 0x18: return 40
+        case 0x28, 0x38: return 40
         default: return 16
         }
     }
     
     var totalBlocks: Int {
         switch sak {
-        case 0x08: return 64     // 1K
-        case 0x09: return 20     // Mini
-        case 0x18: return 256    // 4K
+        case 0x08: return 64
+        case 0x09: return 20
+        case 0x18: return 256
         default: return 64
         }
     }
