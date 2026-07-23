@@ -626,7 +626,7 @@ struct HexEditorView: View {
                 }
             } catch {
                 await MainActor.run {
-                    errorMessage = "\(error.localizedDescription) | \(bleManager.lastDebugLog)"
+                    errorMessage = error.localizedDescription
                     isWriting = false
                 }
             }
