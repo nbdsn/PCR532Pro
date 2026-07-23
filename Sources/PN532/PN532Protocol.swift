@@ -71,7 +71,7 @@ struct PN532Frame {
             frame.append(UInt8((extLen >> 8) & 0xFF))
             frame.append(UInt8(extLen & 0xFF))
             // Extended LCS: 0x10000 - extLen (two bytes, low 8 of each complement style)
-            let lcs = UInt16(0x10000) &- extLen
+            let lcs = UInt16(0) &- extLen  // two's complement of extLen in 16-bit
             frame.append(UInt8((lcs >> 8) & 0xFF))
             frame.append(UInt8(lcs & 0xFF))
             frame.append(contentsOf: payload)
