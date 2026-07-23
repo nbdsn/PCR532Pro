@@ -2,18 +2,19 @@ import Foundation
 import CoreBluetooth
 
 struct PCR532BLE {
-    // Classic SPP service UUID string (Android uses RFCOMM with this UUID).
-    // On BLE bridges it is often reused as a service UUID.
     static let sppUUID = CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB")
     static let nordicService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-    static let nordicWrite = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E") // RX from module view = phone writes
-    static let nordicNotify = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // TX = notify
+    static let nordicWrite = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    static let nordicNotify = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
     static let ffe0 = CBUUID(string: "0000FFE0-0000-1000-8000-00805F9B34FB")
     static let ffe1 = CBUUID(string: "0000FFE1-0000-1000-8000-00805F9B34FB")
     static let fff0 = CBUUID(string: "0000FFF0-0000-1000-8000-00805F9B34FB")
     static let fff1 = CBUUID(string: "0000FFF1-0000-1000-8000-00805F9B34FB")
     static let fff2 = CBUUID(string: "0000FFF2-0000-1000-8000-00805F9B34FB")
     static let fff3 = CBUUID(string: "0000FFF3-0000-1000-8000-00805F9B34FB")
+    
+    /// libnfc pn532_uart_wakeup: 0x55 0x55 + 14 * 0x00
+    static let wakeUp: [UInt8] = [0x55, 0x55] + [UInt8](repeating: 0x00, count: 14)
 }
 
 protocol BLEManagerDelegate: AnyObject {
@@ -64,12 +65,15 @@ class BLEManager: NSObject, ObservableObject {
     private var notifyCharacteristic: CBCharacteristic?
     private var candidateWrite: [CBCharacteristic] = []
     private var candidateNotify: [CBCharacteristic] = []
+    private var allCharacteristics: [CBCharacteristic] = []
     private var responseBuffer = PN532ResponseBuffer()
     private var frameWaitContinuation: CheckedContinuation<PN532Frame, Error>?
     private var didInitPN532 = false
+    private var linkVerified = false
     private var mtuChunkSize = 20
-    private var preferWithoutResponse = true
-    private var charMapTried = 0
+    private var useWithoutResponse = true
+    private var rxByteCount: Int = 0
+    private var debugLines: [String] = []
     
     override init() {
         super.init()
@@ -107,12 +111,15 @@ class BLEManager: NSObject, ObservableObject {
         connectionState = .connecting
         lastErrorMessage = nil
         didInitPN532 = false
-        charMapTried = 0
+        linkVerified = false
+        rxByteCount = 0
         writeCharacteristic = nil
         notifyCharacteristic = nil
         candidateWrite.removeAll()
         candidateNotify.removeAll()
+        allCharacteristics.removeAll()
         responseBuffer.clear()
+        debugLines.removeAll()
         stopScan()
         centralManager.connect(device.peripheral, options: nil)
         connectedPeripheral = device.peripheral
@@ -125,42 +132,89 @@ class BLEManager: NSObject, ObservableObject {
         centralManager.cancelPeripheralConnection(p)
     }
     
-    /// Transparent UART send matching libnfc pn532_uart: stream bytes, wait ACK then response.
+    /// libnfc-style: wake + frame, wait ACK then response. Auto-probe write/notify mapping.
     func sendFrame(_ frame: PN532Frame, timeout: TimeInterval = 8.0) async throws -> PN532Frame {
         guard let peripheral = connectedPeripheral else { throw PN532Error.notConnected }
-        guard connectionState == .ready, writeCharacteristic != nil else {
-            throw PN532Error.communicationError("Write characteristic not ready")
+        guard connectionState == .ready else {
+            throw PN532Error.communicationError("Not ready")
         }
         
         if !didInitPN532 {
-            try await initializePN532()
+            try await probeAndInit()
         }
         
-        responseBuffer.clear()
-        let raw = frame.encode()
-        appendDebug("TX " + hex(raw))
-        try await writeBytes(raw, peripheral: peripheral)
+        let payload = frame.encode()
+        let maps = buildCharMaps()
+        // Prefer last known good map first
+        var ordered = maps
+        if let w = writeCharacteristic, let n = notifyCharacteristic {
+            ordered.insert(CharMap(write: w, notify: n, withoutResponse: useWithoutResponse), at: 0)
+        }
         
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let rem = deadline.timeIntervalSinceNow
-            if rem <= 0 { break }
+        var lastError: Error = PN532Error.timeout
+        // Deduplicate maps
+        var seen = Set<String>()
+        let uniqueMaps = ordered.filter { m in
+            let key = "\(m.write.uuid.uuidString)|\(m.notify?.uuid.uuidString ?? "-")|\(m.withoutResponse)"
+            if seen.contains(key) { return false }
+            seen.insert(key)
+            return true
+        }
+        
+        for (idx, map) in uniqueMaps.enumerated() {
+            writeCharacteristic = map.write
+            notifyCharacteristic = map.notify
+            useWithoutResponse = map.withoutResponse
+            if let n = map.notify {
+                peripheral.setNotifyValue(true, for: n)
+            }
+            // Ensure all notify chars subscribed
+            for n in candidateNotify {
+                peripheral.setNotifyValue(true, for: n)
+            }
+            
+            responseBuffer.clear()
+            // CRITICAL (libnfc): wake preamble immediately before every command
+            let stream = PCR532BLE.wakeUp + payload
+            appendDebug("TX#\(idx) W=\(short(map.write.uuid)) N=\(short(map.notify?.uuid)) WOR=\(map.withoutResponse) \(hex(stream))")
+            
             do {
-                let resp = try await waitForNextFrame(timeout: rem)
-                if resp.isAckPlaceholder {
-                    appendDebug("RX ACK")
-                    continue
-                }
-                if resp.tfi == .pn532ToHost {
-                    appendDebug("RX " + hex(resp.data))
-                    return resp
+                try await writeBytes(stream, peripheral: peripheral)
+            } catch {
+                lastError = error
+                appendDebug("write err: \(error.localizedDescription)")
+                continue
+            }
+            
+            let deadline = Date().addingTimeInterval(min(timeout, 4.0))
+            do {
+                while Date() < deadline {
+                    let rem = max(deadline.timeIntervalSinceNow, 0.05)
+                    let resp = try await waitForNextFrame(timeout: rem)
+                    if resp.isAckPlaceholder {
+                        appendDebug("RX ACK")
+                        continue
+                    }
+                    if resp.tfi == .pn532ToHost {
+                        appendDebug("RX \(hex(resp.data))")
+                        linkVerified = true
+                        return resp
+                    }
                 }
             } catch let e as PN532Error {
-                if case .timeout = e { break }
+                if case .timeout = e {
+                    appendDebug("map#\(idx) timeout rx=\(rxByteCount)")
+                    lastError = e
+                    continue
+                }
                 throw e
+            } catch {
+                lastError = error
             }
         }
-        throw PN532Error.timeout
+        
+        appendDebug("FAIL no RX (rxBytes=\(rxByteCount) writes=\(candidateWrite.count) notifys=\(candidateNotify.count))")
+        throw lastError
     }
     
     func sendRaw(_ data: [UInt8]) {
@@ -168,112 +222,103 @@ class BLEManager: NSObject, ObservableObject {
         Task { try? await writeBytes(data, peripheral: peripheral) }
     }
     
-    // MARK: Init — mirror libnfc pn532_uart_wakeup + SAM + GetFirmwareVersion
+    // MARK: - Probe all UART mappings with GetFirmwareVersion
     
-    private func initializePN532() async throws {
+    private func probeAndInit() async throws {
         guard let peripheral = connectedPeripheral else { throw PN532Error.notConnected }
         
-        // Try current mapping, then alternate write/notify pairs if firmware fails
+        // Subscribe everything notifiable first
+        for n in candidateNotify {
+            peripheral.setNotifyValue(true, for: n)
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        
+        let fw = PN532Frame(tfi: .hostToPN532, data: [0x02]).encode()
+        let sam = PN532Frame(tfi: .hostToPN532, data: [0x14, 0x01, 0x14, 0x01]).encode()
         let maps = buildCharMaps()
-        var lastErr: Error = PN532Error.timeout
+        appendDebug("Probe maps=\(maps.count) W=\(candidateWrite.count) N=\(candidateNotify.count)")
         
         for (idx, map) in maps.enumerated() {
             writeCharacteristic = map.write
             notifyCharacteristic = map.notify
-            if let n = notifyCharacteristic {
+            useWithoutResponse = map.withoutResponse
+            if let n = map.notify {
                 peripheral.setNotifyValue(true, for: n)
             }
-            try await Task.sleep(nanoseconds: 200_000_000)
-            
             responseBuffer.clear()
-            // libnfc wake: 0x55 0x55 + 14x 0x00
-            let wake: [UInt8] = [0x55, 0x55] + [UInt8](repeating: 0x00, count: 14)
-            try await writeBytes(wake, peripheral: peripheral)
-            try await Task.sleep(nanoseconds: 100_000_000)
+            let beforeRX = rxByteCount
             
-            // SAMConfiguration: D4 14 01 00 01  (mode normal, timeout 0, use IRQ)
-            // Note: libnfc often uses 01 14 01
-            responseBuffer.clear()
-            let sam = PN532Frame(tfi: .hostToPN532, data: [0x14, 0x01, 0x14, 0x01])
-            try await writeBytes(sam.encode(), peripheral: peripheral)
-            _ = try? await waitAckThenData(timeout: 2.5)
+            // wake + SAM
+            try? await writeBytes(PCR532BLE.wakeUp + sam, peripheral: peripheral)
+            _ = try? await waitAckThenData(timeout: 1.5)
             
-            // GetFirmwareVersion: D4 02
+            // wake + GetFirmware
             responseBuffer.clear()
-            let fw = PN532Frame(tfi: .hostToPN532, data: [0x02])
-            try await writeBytes(fw.encode(), peripheral: peripheral)
-            do {
-                let resp = try await waitAckThenData(timeout: 3.5)
-                if resp.tfi == .pn532ToHost {
-                    let d = resp.data
-                    // response opcode 0x03 then IC/VER/REV/SUPPORT
-                    appendDebug("FW map#\(idx) " + hex(d))
-                    didInitPN532 = true
-                    charMapTried = idx
-                    return
-                }
-            } catch {
-                lastErr = error
-                appendDebug("FW fail map#\(idx): \(error.localizedDescription)")
+            try? await writeBytes(PCR532BLE.wakeUp + fw, peripheral: peripheral)
+            if let resp = try? await waitAckThenData(timeout: 2.5), resp.tfi == .pn532ToHost {
+                appendDebug("LINK OK map#\(idx) FW \(hex(resp.data)) W=\(short(map.write.uuid))")
+                didInitPN532 = true
+                linkVerified = true
+                return
             }
             
-            // Diagnose 0x00 also used by libnfc check_communication
+            // Also try frame-only (no wake) — some BLE bridges already keep PN532 awake
             responseBuffer.clear()
-            let diag = PN532Frame(tfi: .hostToPN532, data: [0x00, 0x00])
-            try await writeBytes(wake + diag.encode(), peripheral: peripheral)
-            if let resp = try? await waitAckThenData(timeout: 3.0), resp.tfi == .pn532ToHost {
-                appendDebug("DIAG ok map#\(idx)")
+            try? await writeBytes(fw, peripheral: peripheral)
+            if let resp = try? await waitAckThenData(timeout: 2.0), resp.tfi == .pn532ToHost {
+                appendDebug("LINK OK nowake map#\(idx) FW \(hex(resp.data))")
                 didInitPN532 = true
-                charMapTried = idx
+                linkVerified = true
                 return
+            }
+            
+            if rxByteCount > beforeRX {
+                appendDebug("map#\(idx) got \(rxByteCount - beforeRX) raw bytes (parse fail?)")
             }
         }
         
-        // Continue anyway — some firmwares reply only to card cmds after field on
+        // Still mark init done so detect can multi-map retry; but flag weak
         didInitPN532 = true
-        appendDebug("Init weak: \(lastErr.localizedDescription)")
+        linkVerified = false
+        appendDebug("No PN532 ACK yet — will retry maps on each cmd")
     }
     
     private struct CharMap {
         let write: CBCharacteristic
         let notify: CBCharacteristic?
+        let withoutResponse: Bool
     }
     
     private func buildCharMaps() -> [CharMap] {
         var maps: [CharMap] = []
-        // Prefer known pairs
-        let wKnown = candidateWrite.sorted { a, b in scoreWrite(a) > scoreWrite(b) }
-        let nKnown = candidateNotify.sorted { a, b in scoreNotify(a) > scoreNotify(b) }
+        let writes = candidateWrite.sorted { scoreWrite($0) > scoreWrite($1) }
+        let notifys = candidateNotify.sorted { scoreNotify($0) > scoreNotify($1) }
         
-        if let w = wKnown.first {
-            if let n = nKnown.first {
-                maps.append(CharMap(write: w, notify: n))
-                if n.uuid != w.uuid {
-                    // swapped
-                    if candidateWrite.contains(where: { $0.uuid == n.uuid }) || n.properties.contains(.write) || n.properties.contains(.writeWithoutResponse) {
-                        maps.append(CharMap(write: n, notify: w))
-                    }
-                }
-            } else {
-                maps.append(CharMap(write: w, notify: nil))
+        func add(_ w: CBCharacteristic, _ n: CBCharacteristic?, _ wor: Bool) {
+            maps.append(CharMap(write: w, notify: n, withoutResponse: wor))
+        }
+        
+        // Known pairs first
+        for w in writes {
+            for n in notifys {
+                let canWOR = w.properties.contains(.writeWithoutResponse)
+                let canW = w.properties.contains(.write)
+                if canWOR { add(w, n, true) }
+                if canW { add(w, n, false) }
+            }
+            // dual role single char
+            if w.properties.contains(.notify) || w.properties.contains(.indicate) {
+                let canWOR = w.properties.contains(.writeWithoutResponse)
+                if canWOR { add(w, w, true) }
+                if w.properties.contains(.write) { add(w, w, false) }
             }
         }
         
-        // Every writeable as write, every notifiable as notify
-        for w in candidateWrite {
-            for n in candidateNotify {
-                let m = CharMap(write: w, notify: n)
-                if !maps.contains(where: { $0.write.uuid == m.write.uuid && $0.notify?.uuid == m.notify?.uuid }) {
-                    maps.append(m)
-                }
-            }
-        }
-        
-        // Single dual-role chars
-        for c in candidateWrite where c.properties.contains(.notify) || c.properties.contains(.indicate) {
-            let m = CharMap(write: c, notify: c)
-            if !maps.contains(where: { $0.write.uuid == m.write.uuid && $0.notify?.uuid == m.notify?.uuid }) {
-                maps.append(m)
+        // If no notify candidates, still try writes (some modules use indicate later)
+        if notifys.isEmpty {
+            for w in writes {
+                if w.properties.contains(.writeWithoutResponse) { add(w, nil, true) }
+                if w.properties.contains(.write) { add(w, nil, false) }
             }
         }
         
@@ -284,11 +329,11 @@ class BLEManager: NSObject, ObservableObject {
         var s = 0
         let u = c.uuid
         if u == PCR532BLE.nordicWrite { s += 100 }
-        if u == PCR532BLE.ffe1 { s += 90 }
-        if u == PCR532BLE.fff1 { s += 85 }
-        if u == PCR532BLE.fff2 { s += 70 }
-        if c.properties.contains(.writeWithoutResponse) { s += 10 }
-        if c.properties.contains(.write) { s += 5 }
+        if u == PCR532BLE.ffe1 { s += 95 }
+        if u == PCR532BLE.fff1 { s += 90 }
+        if u == PCR532BLE.fff2 { s += 80 }
+        if c.properties.contains(.writeWithoutResponse) { s += 15 }
+        if c.properties.contains(.write) { s += 8 }
         return s
     }
     
@@ -296,11 +341,11 @@ class BLEManager: NSObject, ObservableObject {
         var s = 0
         let u = c.uuid
         if u == PCR532BLE.nordicNotify { s += 100 }
-        if u == PCR532BLE.ffe1 { s += 90 }
-        if u == PCR532BLE.fff2 { s += 85 }
-        if u == PCR532BLE.fff1 { s += 70 }
-        if c.properties.contains(.notify) { s += 10 }
-        if c.properties.contains(.indicate) { s += 5 }
+        if u == PCR532BLE.ffe1 { s += 95 }
+        if u == PCR532BLE.fff2 { s += 90 }
+        if u == PCR532BLE.fff1 { s += 80 }
+        if c.properties.contains(.notify) { s += 15 }
+        if c.properties.contains(.indicate) { s += 8 }
         return s
     }
     
@@ -364,21 +409,20 @@ class BLEManager: NSObject, ObservableObject {
         
         let canWOR = writeChar.properties.contains(.writeWithoutResponse)
         let canW = writeChar.properties.contains(.write)
-        // Prefer withResponse when available — more reliable on some modules
         let writeType: CBCharacteristicWriteType = {
-            if canW && !preferWithoutResponse { return .withResponse }
-            if canWOR { return .withoutResponse }
+            if useWithoutResponse && canWOR { return .withoutResponse }
             if canW { return .withResponse }
-            return .withoutResponse
+            if canWOR { return .withoutResponse }
+            return .withResponse
         }()
         
-        // Prefer single write for entire payload (critical for PN532 frame integrity)
         let maxOnce = peripheral.maximumWriteValueLength(for: writeType)
-        let chunkSize = max(20, maxOnce > 0 ? maxOnce : mtuChunkSize)
+        let chunkSize = max(20, maxOnce > 0 ? min(maxOnce, 180) : mtuChunkSize)
         
+        // Prefer single packet for wake+frame (usually < 40 bytes)
         if data.count <= chunkSize {
             peripheral.writeValue(Data(data), for: writeChar, type: writeType)
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 80_000_000)
             return
         }
         
@@ -387,40 +431,55 @@ class BLEManager: NSObject, ObservableObject {
             let end = min(offset + chunkSize, data.count)
             peripheral.writeValue(Data(Array(data[offset..<end])), for: writeChar, type: writeType)
             offset = end
-            try await Task.sleep(nanoseconds: 25_000_000)
+            try await Task.sleep(nanoseconds: 30_000_000)
         }
-        try await Task.sleep(nanoseconds: 40_000_000)
+        try await Task.sleep(nanoseconds: 50_000_000)
     }
     
     private func appendDebug(_ s: String) {
-        lastDebugLog = s
-        #if DEBUG
-        print("[PCR532] \(s)")
-        #endif
+        debugLines.append(s)
+        if debugLines.count > 8 { debugLines.removeFirst(debugLines.count - 8) }
+        lastDebugLog = debugLines.joined(separator: "\n")
     }
     
     private func hex(_ d: [UInt8]) -> String {
         d.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
     
+    private func short(_ uuid: CBUUID?) -> String {
+        guard let uuid = uuid else { return "-" }
+        let s = uuid.uuidString
+        if s.count > 8 { return String(s.prefix(8)) }
+        return s
+    }
+    
     private func markReadyIfPossible() {
-        if writeCharacteristic != nil || !candidateWrite.isEmpty {
-            if writeCharacteristic == nil {
-                writeCharacteristic = candidateWrite.sorted { scoreWrite($0) > scoreWrite($1) }.first
+        if !candidateWrite.isEmpty {
+            writeCharacteristic = candidateWrite.sorted { scoreWrite($0) > scoreWrite($1) }.first
+            notifyCharacteristic = candidateNotify.sorted { scoreNotify($0) > scoreNotify($1) }.first
+            if let n = notifyCharacteristic, let p = connectedPeripheral {
+                p.setNotifyValue(true, for: n)
             }
-            if notifyCharacteristic == nil {
-                notifyCharacteristic = candidateNotify.sorted { scoreNotify($0) > scoreNotify($1) }.first
-                if let n = notifyCharacteristic, let p = connectedPeripheral {
-                    p.setNotifyValue(true, for: n)
-                }
+            for n in candidateNotify {
+                connectedPeripheral?.setNotifyValue(true, for: n)
             }
             connectionState = .ready
             isConnected = true
             lastErrorMessage = nil
-            let w = writeCharacteristic?.uuid.uuidString ?? "?"
-            let n = notifyCharacteristic?.uuid.uuidString ?? "?"
-            appendDebug("Ready W=\(w) N=\(n)")
+            let wdesc = candidateWrite.map { short($0.uuid) + props($0) }.joined(separator: ",")
+            let ndesc = candidateNotify.map { short($0.uuid) + props($0) }.joined(separator: ",")
+            appendDebug("Ready W:[\(wdesc)] N:[\(ndesc)]")
         }
+    }
+    
+    private func props(_ c: CBCharacteristic) -> String {
+        var p = ""
+        if c.properties.contains(.write) { p += "W" }
+        if c.properties.contains(.writeWithoutResponse) { p += "w" }
+        if c.properties.contains(.notify) { p += "N" }
+        if c.properties.contains(.indicate) { p += "I" }
+        if c.properties.contains(.read) { p += "R" }
+        return "(\(p))"
     }
 }
 
@@ -450,7 +509,6 @@ extension BLEManager: CBCentralManagerDelegate {
         let maxLen = peripheral.maximumWriteValueLength(for: .withoutResponse)
         if maxLen > 0 { mtuChunkSize = max(20, min(maxLen, 180)) }
         delegate?.bleDidConnect(BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral))
-        // Discover ALL services — PCR532 BLE bridges use various custom UUIDs
         peripheral.discoverServices(nil)
     }
     
@@ -467,6 +525,7 @@ extension BLEManager: CBCentralManagerDelegate {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         didInitPN532 = false
+        linkVerified = false
         failPending(PN532Error.notConnected)
         delegate?.bleDidDisconnect(
             BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral),
@@ -487,7 +546,7 @@ extension BLEManager: CBPeripheralDelegate {
             connectionState = .disconnected
             return
         }
-        appendDebug("Services: \(services.map { $0.uuid.uuidString }.joined(separator: ","))")
+        appendDebug("SVC \(services.map { short($0.uuid) }.joined(separator: ","))")
         for s in services {
             peripheral.discoverCharacteristics(nil, for: s)
         }
@@ -499,26 +558,38 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
         for c in service.characteristics ?? [] {
+            allCharacteristics.append(c)
             let canW = c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse)
             let canN = c.properties.contains(.notify) || c.properties.contains(.indicate)
-            appendDebug("Char \(c.uuid.uuidString) W=\(canW) N=\(canN)")
             if canW { candidateWrite.append(c) }
             if canN {
                 candidateNotify.append(c)
-                peripheral.setNotifyValue(true, for: c) // subscribe all notifiable
+                peripheral.setNotifyValue(true, for: c)
+            }
+            // Some cheap modules mark UART char only as read+write; still try write
+            if !canW && !canN && c.properties.contains(.read) {
+                // skip pure read
+            } else if !canW && c.properties.contains(.write) == false {
+                // nothing
             }
         }
-        markReadyIfPossible()
+        
+        // Ready when all services have characteristics discovered
+        let pending = (peripheral.services ?? []).contains { $0.characteristics == nil }
+        if !pending {
+            markReadyIfPossible()
+        }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            delegate?.bleDidEncounterError(error)
+            appendDebug("notify err \(error.localizedDescription)")
             return
         }
         guard let value = characteristic.value, !value.isEmpty else { return }
         let bytes = [UInt8](value)
-        appendDebug("NOTIFY " + hex(bytes))
+        rxByteCount += bytes.count
+        appendDebug("RXN \(short(characteristic.uuid)) \(hex(bytes))")
         responseBuffer.append(bytes)
         deliverBufferedFrames()
         delegate?.bleDidReceiveData(bytes)
@@ -526,17 +597,17 @@ extension BLEManager: CBPeripheralDelegate {
     
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            // Some modules error on withResponse; flip preference
-            preferWithoutResponse = true
-            appendDebug("Write err: \(error.localizedDescription)")
+            appendDebug("WRerr \(error.localizedDescription)")
+            // Prefer withoutResponse next time
+            useWithoutResponse = true
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            appendDebug("Notify state err: \(error.localizedDescription)")
+            appendDebug("CCCD err \(short(characteristic.uuid)): \(error.localizedDescription)")
         } else {
-            appendDebug("Notify ON \(characteristic.uuid.uuidString)")
+            appendDebug("CCCD on \(short(characteristic.uuid))")
         }
     }
 }
