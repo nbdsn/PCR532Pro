@@ -63,22 +63,22 @@ struct MagicCardView: View {
                 // Section: UID input (for write UID / write Block 0)
                 if selectedOperation == .writeUID || selectedOperation == .writeBlock0 {
                     Section("新 UID (十六进制)") {
-                        TextField("4字节: AABBCCDD 或 7字节: AABBCCDDEEFFGG", text: $newUID)
+                        TextField("UID hex", text: $newUID)
                             .font(.system(.body, design: .monospaced))
                             .textInputAutocapitalization(.characters)
                         
                         HStack {
-                            QuickActionButton("随机 UID", color: .blue) {
+                            QuickActionButton("Random UID", color: .blue) {
                                 newUID = generateRandomUID()
                             }
-                            QuickActionButton("原 UID", color: .green) {
+                            QuickActionButton("Copy UID", color: .green) {
                                 if let card = mifareController.currentCard {
                                     newUID = card.uidString.replacingOccurrences(of: ":", with: "")
                                 }
                             }
                         }
                         
-                        Text("示例: 4字节 UID = 8个字符, 7字节 = 14个字符")
+                        Text("Example: 4-byte UID = 8 hex chars, 7-byte = 14 hex chars")
                             .font(.caption)
                             .foregroundColor(.gray)
                     }

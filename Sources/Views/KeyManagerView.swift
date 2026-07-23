@@ -193,9 +193,9 @@ struct KeyManagerView: View {
     private var addKeySheet: some View {
         NavigationView {
             Form {
-                Section("添加自定义密钥") {
-                    TextField("密钥名称（如: 电梯卡）", text: $newKeyLabel)
-                    TextField("六字节十六进制（如: FFFFFFFFFFFF）", text: $newKeyHex)
+                Section("Add custom key") {
+                    TextField("Key name", text: $newKeyLabel)
+                    TextField("6-byte hex e.g. FFFFFFFFFFFF", text: $newKeyHex)
                         .font(.system(.body, design: .monospaced))
                         .textInputAutocapitalization(.characters)
                     
@@ -220,7 +220,7 @@ struct KeyManagerView: View {
                     .padding(.vertical, 4)
                 }
             }
-            .navigationTitle("添加密钥")
+            .navigationTitle("Add Key")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {

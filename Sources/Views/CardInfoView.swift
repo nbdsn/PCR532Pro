@@ -320,7 +320,7 @@ struct HexEditorView: View {
     private func writeBlock() {
         let cleaned = hexText.replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\n", with: "")
-        guard cleaned.count == 32, let bytes = cleaned.hexToBytes(), bytes.count == 16 else {
+        guard cleaned.count == 32, let bytes = UInt8.hexToBytes(cleaned), bytes.count == 16 else {
             errorMessage = "Need 16 bytes hex"
             return
         }
@@ -345,21 +345,25 @@ struct HexEditorView: View {
 // MARK: - Quick Action Button
 struct QuickActionButton: View {
     let title: String
-    let icon: String
     let color: Color
     let action: () -> Void
     
+    init(_ title: String, color: Color, action: @escaping () -> Void) {
+        self.title = title
+        self.color = color
+        self.action = action
+    }
+    
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: icon).font(.title2)
-                Text(title).font(.caption)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(color.opacity(0.15))
-            .foregroundColor(color)
-            .cornerRadius(10)
+            Text(title)
+                .font(.caption)
+                .fontWeight(.medium)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(color.opacity(0.15))
+                .foregroundColor(color)
+                .cornerRadius(8)
         }
     }
 }
