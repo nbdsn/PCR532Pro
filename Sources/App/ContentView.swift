@@ -153,10 +153,7 @@ struct ContentView: View {
             .padding(.top, 4)
             
             // Card info section
-            CardInfoView(
-                cardInfo: mifareController.currentCard,
-                mifareController: mifareController
-            )
+            CardInfoView(cardInfo: mifareController.currentCard, mifareController: mifareController, bleManager: bleManager)
         }
     }
 }

@@ -225,42 +225,43 @@ class MIFAREController: ObservableObject {
     
     // MARK: - Card Detection
     
-    /// Detect card and get UID/SAK/ATQA
+    /// Detect card and get UID/SAK/ATQA (libnfc-style InListPassiveTarget)
     func detectCard() async throws -> CardInfo {
         statusMessage = "Detecting card..."
         
-        // Prefer InListPassiveTarget (standard, reliable on PN532 UART bridges)
+        // RFConfiguration MaxRetries (cmd 0x32 item 0x05) — improves passive activation
+        _ = try? await bleManager.sendFrame(
+            PN532Frame(tfi: .hostToPN532, data: [0x32, 0x05, 0xFF, 0x01, 0xFF]),
+            timeout: 4.0
+        )
+        
+        // InListPassiveTarget: max 1, 106kbps type A
+        let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
         do {
-            let listFrame = PN532CommandBuilder.listPassiveTarget(maxTargets: 1, baudRate: 0x00)
-            let response = try await bleManager.sendFrame(listFrame, timeout: 10.0)
+            let response = try await bleManager.sendFrame(listFrame, timeout: 12.0)
             let cards = PN532ResponseParser.parseTargetList(response.data)
             if let card = cards.first {
                 await MainActor.run {
                     currentCard = card
-                    statusMessage = "Found: \(card.typeDescription) (UID: \(card.uidString))"
+                    statusMessage = "Found: \(card.typeDescription) UID \(card.uidString)"
                 }
                 return card
             }
-        } catch {
-            // fall through to auto poll
-            statusMessage = "Retry with AutoPoll..."
-        }
-        
-        let pollFrame = PN532CommandBuilder.autoPoll(maxCards: 1, period: 1)
-        let pollResponse = try await bleManager.sendFrame(pollFrame, timeout: 12.0)
-        let cards = PN532ResponseParser.parseTargetList(pollResponse.data)
-        guard let card = cards.first else {
             throw PN532Error.noCardPresent
+        } catch PN532Error.timeout {
+            // Retry once after re-wake via another firmware poke
+            statusMessage = "Retry detect..."
+            let response = try await bleManager.sendFrame(listFrame, timeout: 12.0)
+            let cards = PN532ResponseParser.parseTargetList(response.data)
+            guard let card = cards.first else { throw PN532Error.noCardPresent }
+            await MainActor.run {
+                currentCard = card
+                statusMessage = "Found: \(card.typeDescription) UID \(card.uidString)"
+            }
+            return card
         }
-        
-        await MainActor.run {
-            currentCard = card
-            statusMessage = "Found: \(card.typeDescription) (UID: \(card.uidString))"
-        }
-        return card
     }
     
-    /// Detect card using InListPassiveTarget
     func detectCardDirect() async throws -> CardInfo {
         try await detectCard()
     }
